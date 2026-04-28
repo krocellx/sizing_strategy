@@ -1,0 +1,54 @@
+from .simulation import (
+    politis_white_L,
+    stationary_bootstrap_indices,
+    apply_indices,
+    generate_scenarios,
+)
+from .stop_rules import StopRule, NoStop, TrailingStopRule
+from .engine import BacktestResult, run_backtest, compare
+from .cache import CachedResult, run_backtest_chunked
+from .analysis import (
+    percentile_table, cvar, cvar_table,
+    plot_distribution_overlay,
+    time_under_water, recovery_times, drawdown_summary,
+    conditional_comparison, combine_sleeves,
+    paired_comparison, bootstrap_ci,
+)
+from .sensitivity import (
+    sensitivity_to_L,
+    sensitivity_to_rule_params,
+    sensitivity_to_capital,
+)
+from .institutional import (
+    rolling_return_stats,
+    dd_threshold_probabilities,
+    stop_activity,
+    plot_equity_fan,
+    plot_drawdown_fan,
+    plot_pct_at_hwm,
+    plot_return_vs_dd_scatter,
+    plot_did_stop_help,
+    institutional_summary,
+)
+
+__all__ = [
+    # simulation
+    "politis_white_L", "stationary_bootstrap_indices", "apply_indices",
+    "generate_scenarios",
+    # rules & engine
+    "StopRule", "NoStop", "TrailingStopRule",
+    "BacktestResult", "run_backtest", "compare",
+    "CachedResult", "run_backtest_chunked",
+    # analysis
+    "percentile_table", "cvar", "cvar_table",
+    "plot_distribution_overlay",
+    "time_under_water", "recovery_times", "drawdown_summary",
+    "conditional_comparison", "combine_sleeves",
+    "paired_comparison", "bootstrap_ci",
+    # sensitivity
+    "sensitivity_to_L", "sensitivity_to_rule_params", "sensitivity_to_capital",
+    # institutional
+    "rolling_return_stats", "dd_threshold_probabilities", "stop_activity",
+    "plot_equity_fan", "plot_drawdown_fan", "plot_pct_at_hwm",
+    "plot_return_vs_dd_scatter", "plot_did_stop_help", "institutional_summary",
+]
