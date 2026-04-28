@@ -162,7 +162,7 @@ def plot_equity_fan(
 
 def plot_drawdown_fan(
     results: Sequence[BacktestResult],
-    percentiles: Sequence[float] = (0.50, 0.75, 0.95, 0.99),
+    percentiles: Sequence[float] = (0.25, 0.50, 0.75, 0.95),
     ax=None,
     periods_per_year: int = 252,
     title: str | None = None,
@@ -170,8 +170,17 @@ def plot_drawdown_fan(
     """
     Underwater fan chart: drawdown from running HWM over time, by percentile.
 
-    Reads very naturally to investors — 'in a bad year (p95), you'd be down X%
-    for Y days'. Pairs with the equity fan to show 'time underwater' pain.
+    Percentiles here describe the DISTRIBUTION OF DRAWDOWNS across paths at
+    each point in time:
+      - Low percentile (e.g. 0.25): paths with small drawdown — near their HWM
+      - High percentile (e.g. 0.95): paths with large drawdown — badly underwater
+
+    With the y-axis inverted (deeper = lower), low-percentile lines plot near
+    the top (near 0%), high-percentile lines plot deep.
+
+    Note: since only ~3-5% of paths are at their exact HWM at any given moment,
+    even the p25 line will typically show some drawdown. This is normal for any
+    volatile strategy — it simply reflects that most paths are between highs.
     """
     if ax is None:
         _, ax = plt.subplots(figsize=(11, 5))
@@ -179,7 +188,7 @@ def plot_drawdown_fan(
     for i, r in enumerate(results):
         eq = r.equity_curves
         hwm = np.maximum.accumulate(eq, axis=1)
-        dd_pct = (hwm - eq) / hwm  # positive numbers = drawdown magnitude
+        dd_pct = (hwm - eq) / hwm  # positive = drawdown magnitude
         t = np.arange(eq.shape[1]) / periods_per_year
         c = colors[i % len(colors)]
         for j, q in enumerate(percentiles):
@@ -194,6 +203,47 @@ def plot_drawdown_fan(
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{x:.0%}'))
     ax.set_title(title or 'Drawdown fan chart (by percentile)')
     ax.legend(fontsize=8, loc='lower left', ncol=2)
+    ax.grid(alpha=0.3)
+    return ax
+
+
+def plot_pct_at_hwm(
+    results: Sequence[BacktestResult],
+    ax=None,
+    periods_per_year: int = 252,
+    title: str | None = None,
+):
+    """
+    Fraction of paths at their HWM (drawdown = 0%) at each point in time.
+
+    This directly answers "how often is the strategy making new highs?"
+    Complements the drawdown fan: the drawdown fan shows depth for paths
+    that ARE in drawdown; this shows how many paths are NOT in drawdown.
+
+    Typical pattern:
+      - Starts at 100% (all paths at inception = HWM by definition)
+      - Drops quickly as paths diverge
+      - Stabilises around 3-5% for a volatile strategy (at any snapshot,
+        only a small fraction happen to be exactly at their all-time high)
+      - Stop rules show LOWER fraction than NoStop (paths go flat after
+        stop-out and can never make new highs while flat)
+    """
+    if ax is None:
+        _, ax = plt.subplots(figsize=(11, 5))
+    colors = plt.cm.tab10.colors
+    for i, r in enumerate(results):
+        eq = r.equity_curves
+        hwm = np.maximum.accumulate(eq, axis=1)
+        at_hwm = (eq >= hwm).mean(axis=0)   # fraction at HWM each day
+        t = np.arange(eq.shape[1]) / periods_per_year
+        c = colors[i % len(colors)]
+        ax.plot(t, at_hwm, color=c, lw=1.5,
+                label=f'{r.strategy_name}/{r.rule_name}')
+    ax.set_xlabel('Years')
+    ax.set_ylabel('Fraction of paths at HWM')
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{x:.0%}'))
+    ax.set_title(title or 'Fraction of paths at all-time high (HWM)')
+    ax.legend(fontsize=9)
     ax.grid(alpha=0.3)
     return ax
 
