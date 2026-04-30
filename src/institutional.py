@@ -327,8 +327,303 @@ def plot_did_stop_help(
 
 
 # ---------------------------------------------------------------------------
-# Convenience: institutional one-pager table
+# New presentation-grade plot functions
 # ---------------------------------------------------------------------------
+
+def plot_calmar_bar(
+    results: Sequence[BacktestResult],
+    ax=None,
+    title: str | None = None,
+):
+    """
+    Grouped bar chart of mean Calmar ratio (CAGR / max DD) per strategy and rule.
+
+    The single most important institutional metric in one glance. Groups by
+    strategy, bars per rule. Higher = better risk-adjusted return.
+    """
+    if ax is None:
+        _, ax = plt.subplots(figsize=(12, 5))
+
+    # Build DataFrame of Calmar values.
+    rows = []
+    for r in results:
+        eq = r.equity_curves
+        years = (eq.shape[1] - 1) / 252
+        cagr = (eq[:, -1] / eq[:, 0]) ** (1 / years) - 1
+        dd_pct = r.max_drawdown_pct
+        calmar = np.where(dd_pct > 0, cagr / dd_pct, np.nan)
+        rows.append({'strategy': r.strategy_name, 'rule': r.rule_name,
+                     'calmar': float(np.nanmean(calmar))})
+    df = pd.DataFrame(rows)
+
+    strategies = df['strategy'].unique()
+    rules = df['rule'].unique()
+    x = np.arange(len(strategies))
+    width = 0.8 / len(rules)
+    colors = plt.cm.tab10.colors
+
+    for i, rule in enumerate(rules):
+        vals = [df[(df.strategy == s) & (df.rule == rule)]['calmar'].values
+                for s in strategies]
+        vals = [v[0] if len(v) else np.nan for v in vals]
+        offset = (i - len(rules) / 2 + 0.5) * width
+        bars = ax.bar(x + offset, vals, width=width * 0.9,
+                      label=rule, color=colors[i % len(colors)], alpha=0.85)
+        for bar, val in zip(bars, vals):
+            if not np.isnan(val):
+                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.005,
+                        f'{val:.2f}', ha='center', va='bottom', fontsize=7)
+
+    ax.axhline(0, color='k', lw=0.8, alpha=0.4)
+    ax.set_xticks(x)
+    ax.set_xticklabels(strategies, rotation=15, ha='right')
+    ax.set_ylabel('Mean Calmar Ratio (CAGR / Max DD)')
+    ax.set_title(title or 'Calmar Ratio by Strategy and Rule')
+    ax.legend(fontsize=9, loc='upper right')
+    ax.grid(axis='y', alpha=0.3)
+    return ax
+
+
+def plot_dd_breach_heatmap(
+    results: Sequence[BacktestResult],
+    thresholds: Sequence[float] = (0.05, 0.10, 0.15, 0.20, 0.30, 0.50),
+    ax=None,
+    title: str | None = None,
+):
+    """
+    Heatmap of P(max DD > threshold) — strategy × threshold, one panel per rule.
+
+    Colour = probability of breaching that DD level. Stop rules should show
+    a hard colour boundary at their stop threshold (e.g. near-zero probability
+    above 20% for a $2m stop on a $10m book).
+    """
+    rules = list(dict.fromkeys(r.rule_name for r in results))
+    strategies = list(dict.fromkeys(r.strategy_name for r in results))
+
+    n_rules = len(rules)
+    fig_needed = ax is None
+    if fig_needed:
+        fig, axes = plt.subplots(1, n_rules, figsize=(4 * n_rules, 4),
+                                 sharey=True)
+        if n_rules == 1:
+            axes = [axes]
+    else:
+        axes = [ax] * n_rules
+
+    result_lookup = {(r.strategy_name, r.rule_name): r for r in results}
+    labels = [f'{int(t*100)}%' for t in thresholds]
+
+    for j, rule in enumerate(rules):
+        matrix = []
+        for strat in strategies:
+            key = (strat, rule)
+            if key in result_lookup:
+                dd_pct = result_lookup[key].max_drawdown_pct
+                row = [(dd_pct > t).mean() for t in thresholds]
+            else:
+                row = [np.nan] * len(thresholds)
+            matrix.append(row)
+        matrix = np.array(matrix)
+
+        im = axes[j].imshow(matrix, aspect='auto', cmap='RdYlGn_r',
+                            vmin=0, vmax=1)
+        axes[j].set_xticks(range(len(thresholds)))
+        axes[j].set_xticklabels(labels, rotation=45, ha='right', fontsize=8)
+        if j == 0:
+            axes[j].set_yticks(range(len(strategies)))
+            axes[j].set_yticklabels(strategies, fontsize=8)
+        axes[j].set_title(rule, fontsize=9)
+        for row_i in range(len(strategies)):
+            for col_i in range(len(thresholds)):
+                val = matrix[row_i, col_i]
+                if not np.isnan(val):
+                    axes[j].text(col_i, row_i, f'{val:.0%}',
+                                 ha='center', va='center', fontsize=7,
+                                 color='white' if val > 0.6 else 'black')
+
+    if fig_needed:
+        fig.colorbar(im, ax=axes, label='P(max DD > threshold)')
+        fig.suptitle(title or 'Drawdown Breach Probability Heatmap',
+                     fontsize=11, y=1.02)
+    return axes
+
+
+def plot_rolling_return_violin(
+    results: Sequence[BacktestResult],
+    window_days: int = 252,
+    ax=None,
+    title: str | None = None,
+    max_sample: int = 50_000,
+):
+    """
+    Violin plot of rolling 1-year return distribution per rule, grouped by strategy.
+
+    Shows the full distribution shape — width at each return level shows
+    where mass concentrates. Much more informative than a table of percentiles.
+    Immediately comparable across rules: a good stop narrows the left tail.
+    """
+    if ax is None:
+        _, ax = plt.subplots(figsize=(14, 6))
+
+    strategies = list(dict.fromkeys(r.strategy_name for r in results))
+    rules = list(dict.fromkeys(r.rule_name for r in results))
+    colors = plt.cm.tab10.colors
+
+    positions = []
+    data_list = []
+    labels = []
+    tick_pos = []
+    tick_labels = []
+
+    group_width = len(rules) + 1
+    for s_idx, strat in enumerate(strategies):
+        group_center = s_idx * group_width + len(rules) / 2
+        tick_pos.append(group_center)
+        tick_labels.append(strat)
+        for r_idx, rule in enumerate(rules):
+            match = [r for r in results
+                     if r.strategy_name == strat and r.rule_name == rule]
+            if not match:
+                continue
+            r = match[0]
+            eq = r.equity_curves
+            if eq.shape[1] <= window_days:
+                continue
+            roll = (eq[:, window_days:] / eq[:, :-window_days] - 1).ravel()
+            # Subsample if too large for violin.
+            if len(roll) > max_sample:
+                rng = np.random.default_rng(0)
+                roll = rng.choice(roll, max_sample, replace=False)
+            pos = s_idx * group_width + r_idx
+            positions.append(pos)
+            data_list.append(roll)
+            labels.append(rule)
+
+    if data_list:
+        parts = ax.violinplot(data_list, positions=positions,
+                              showmedians=True, showextrema=False, widths=0.8)
+        for i, (pc, pos) in enumerate(zip(parts['bodies'], positions)):
+            rule_idx = rules.index(labels[i])
+            pc.set_facecolor(colors[rule_idx % len(colors)])
+            pc.set_alpha(0.6)
+        parts['cmedians'].set_colors('black')
+        parts['cmedians'].set_linewidth(1.5)
+
+    ax.axhline(0, color='k', ls='--', alpha=0.5, lw=0.8)
+    ax.set_xticks(tick_pos)
+    ax.set_xticklabels(tick_labels, rotation=15, ha='right')
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f'{y:.0%}'))
+    ax.set_ylabel(f'Rolling {window_days//252:.0f}-yr Return')
+    ax.set_title(title or f'Rolling {window_days//252:.0f}-Year Return Distribution by Rule')
+
+    # Legend.
+    handles = [plt.Rectangle((0, 0), 1, 1, color=colors[i % len(colors)], alpha=0.6)
+               for i, rule in enumerate(rules)]
+    ax.legend(handles, rules, fontsize=9, loc='upper right')
+    ax.grid(axis='y', alpha=0.3)
+    return ax
+
+
+def plot_stop_activity_bar(
+    results: Sequence[BacktestResult],
+    periods_per_year: int = 252,
+    ax=None,
+    title: str | None = None,
+):
+    """
+    Stacked bar chart: days per year at full / reduced / stopped size, per result.
+
+    Immediately shows the operational cost of each rule — how many business
+    days per year the strategy runs at reduced or zero exposure.
+    """
+    if ax is None:
+        _, ax = plt.subplots(figsize=(13, 5))
+
+    labels, full_days, reduced_days, stopped_days = [], [], [], []
+    for r in results:
+        sizes = r.position_sizes
+        n_days = sizes.shape[1]
+        years = n_days / periods_per_year
+        full    = (sizes == 1.0).mean(axis=1).mean() * periods_per_year
+        stopped = (sizes == 0.0).mean(axis=1).mean() * periods_per_year
+        reduced = periods_per_year - full - stopped
+        labels.append(f'{r.strategy_name}\n{r.rule_name}')
+        full_days.append(full)
+        reduced_days.append(reduced)
+        stopped_days.append(stopped)
+
+    x = np.arange(len(labels))
+    width = 0.6
+    p1 = ax.bar(x, full_days,    width, label='Full size (1.0)',
+                color='tab:green', alpha=0.8)
+    p2 = ax.bar(x, reduced_days, width, bottom=full_days,
+                label='Reduced (0 < size < 1)', color='tab:orange', alpha=0.8)
+    bottom2 = [f + r for f, r in zip(full_days, reduced_days)]
+    p3 = ax.bar(x, stopped_days, width, bottom=bottom2,
+                label='Stopped (size = 0)', color='tab:red', alpha=0.8)
+
+    # Value labels on reduced + stopped segments.
+    for i, (rd, sd) in enumerate(zip(reduced_days, stopped_days)):
+        if rd > 2:
+            ax.text(x[i], full_days[i] + rd / 2, f'{rd:.0f}d',
+                    ha='center', va='center', fontsize=7, color='white')
+        if sd > 2:
+            ax.text(x[i], bottom2[i] + sd / 2, f'{sd:.0f}d',
+                    ha='center', va='center', fontsize=7, color='white')
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=8)
+    ax.set_ylabel('Business days per year')
+    ax.set_title(title or 'Stop Activity: Days at Each Size Level (per year)')
+    ax.legend(fontsize=9, loc='upper right')
+    ax.axhline(periods_per_year, color='k', ls=':', alpha=0.3)
+    ax.grid(axis='y', alpha=0.3)
+    return ax
+
+
+def plot_conditional_diverging(
+    conditional_df: pd.DataFrame,
+    ax=None,
+    title: str | None = None,
+):
+    """
+    Diverging horizontal bar chart of stop rule's per-bucket mean return delta.
+
+    Input: output of conditional_comparison() from analysis.py.
+    x-axis = delta_mean_tr (positive = stop helped, negative = stop hurt).
+    One bar per bucket (sorted worst to best market environment).
+
+    Immediately shows "the stop helps in crisis buckets, hurts in calm ones."
+    """
+    if ax is None:
+        _, ax = plt.subplots(figsize=(9, 4))
+
+    df = conditional_df.copy()
+    deltas = df['delta_mean_tr'].values
+    buckets = df['bucket_range'].values
+    n = len(df)
+    y = np.arange(n)
+
+    colors = ['tab:green' if d >= 0 else 'tab:red' for d in deltas]
+    bars = ax.barh(y, deltas, color=colors, alpha=0.8, height=0.6)
+
+    # Value labels.
+    for bar, val in zip(bars, deltas):
+        x_pos = val + (0.002 if val >= 0 else -0.002)
+        ha = 'left' if val >= 0 else 'right'
+        ax.text(x_pos, bar.get_y() + bar.get_height() / 2,
+                f'{val:+.1%}', va='center', ha=ha, fontsize=8)
+
+    ax.set_yticks(y)
+    ax.set_yticklabels([f'Bucket {df.iloc[i]["bucket"]} {buckets[i]}'
+                        for i in range(n)], fontsize=8)
+    ax.axvline(0, color='k', lw=1, alpha=0.7)
+    ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{x:+.0%}'))
+    ax.set_xlabel('Mean terminal return delta (treated − baseline)')
+    ax.set_title(title or 'Stop Rule Effect by Market Regime Bucket\n'
+                           '(Bucket 0 = worst 20% of paths)')
+    ax.grid(axis='x', alpha=0.3)
+    return ax
 
 def institutional_summary(
     results: Sequence[BacktestResult],

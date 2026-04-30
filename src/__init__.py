@@ -29,6 +29,11 @@ from .institutional import (
     plot_return_vs_dd_scatter,
     plot_did_stop_help,
     institutional_summary,
+    plot_calmar_bar,
+    plot_dd_breach_heatmap,
+    plot_rolling_return_violin,
+    plot_stop_activity_bar,
+    plot_conditional_diverging,
 )
 
 __all__ = [
@@ -51,4 +56,6 @@ __all__ = [
     "rolling_return_stats", "dd_threshold_probabilities", "stop_activity",
     "plot_equity_fan", "plot_drawdown_fan", "plot_pct_at_hwm",
     "plot_return_vs_dd_scatter", "plot_did_stop_help", "institutional_summary",
+    "plot_calmar_bar", "plot_dd_breach_heatmap", "plot_rolling_return_violin",
+    "plot_stop_activity_bar", "plot_conditional_diverging",
 ]
