@@ -279,3 +279,24 @@ cond = conditional_comparison(
 fig, ax = plt.subplots(figsize=(9, 4))
 plot_conditional_diverging(cond, ax=ax,
     title='US Ten Stocks: TwoRed vs NoStop by market regime')
+
+from src import plot_size_change_frequency, plot_historical_events, TrailingStopRule
+
+# Frequency plot — use the simulated results you already have
+fig, ax = plt.subplots(figsize=(12, 5))
+plot_size_change_frequency(
+    [results[('US Ten Stocks', 'hard')],
+     results[('US Ten Stocks', 'one_red')],
+     results[('US Ten Stocks', 'two_red')]],
+    ax=ax, window_days=21,
+)
+
+# Historical events — run on actual data, once per (strategy, rule) combo
+fig, _ = plt.subplots(figsize=(14, 6))
+plot_historical_events(
+    historical_returns['US Ten Stocks'],
+    TrailingStopRule(levels=TWO_RED_LEVELS, reentry_recovery=REENTRY_TWO_RED,
+                     label='TwoRed'),
+    'US Ten Stocks',
+    CAPITALS['US Ten Stocks'],
+)

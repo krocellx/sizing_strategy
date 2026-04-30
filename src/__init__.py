@@ -34,6 +34,8 @@ from .institutional import (
     plot_rolling_return_violin,
     plot_stop_activity_bar,
     plot_conditional_diverging,
+    plot_size_change_frequency,
+    plot_historical_events,
 )
 
 __all__ = [
@@ -58,4 +60,5 @@ __all__ = [
     "plot_return_vs_dd_scatter", "plot_did_stop_help", "institutional_summary",
     "plot_calmar_bar", "plot_dd_breach_heatmap", "plot_rolling_return_violin",
     "plot_stop_activity_bar", "plot_conditional_diverging",
+    "plot_size_change_frequency", "plot_historical_events",
 ]

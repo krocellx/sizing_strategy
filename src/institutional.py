@@ -625,6 +625,161 @@ def plot_conditional_diverging(
     ax.grid(axis='x', alpha=0.3)
     return ax
 
+
+def plot_size_change_frequency(
+    results: Sequence[BacktestResult],
+    window_days: int = 21,
+    periods_per_year: int = 252,
+    ax=None,
+    title: str | None = None,
+):
+    """
+    Rolling event density over simulated path time: average number of
+    size-change events per month at each point in the simulated period,
+    averaged across all paths.
+
+    Signs to look for:
+      - Spike at the start then near-zero: rule fires quickly, paths go flat.
+        This is the permanent stopout problem — rule isn't actively managing,
+        it's just stopping.
+      - Roughly uniform density: rule actively manages throughout the period.
+      - Clustered spikes: stress periods are concentrated in certain simulated
+        regimes (expected if block bootstrap preserved crisis clustering).
+
+    High frequency overall = rule may be whipsawing on noise.
+    High frequency only in early months = stopout-dominated.
+    """
+    if ax is None:
+        _, ax = plt.subplots(figsize=(12, 5))
+    colors = plt.cm.tab10.colors
+
+    for i, r in enumerate(results):
+        if r.rule_name == 'NoStop':
+            continue
+        sizes = r.position_sizes          # (n_paths, n_days)
+        n_paths, n_days = sizes.shape
+        prev = np.concatenate([np.ones((n_paths, 1)), sizes[:, :-1]], axis=1)
+        events = (sizes != prev).astype(float)  # 1 where size changed
+
+        # Rolling window sum averaged across paths.
+        density = pd.DataFrame(events.T).rolling(window_days).sum().mean(axis=1)
+        t = np.arange(len(density)) / periods_per_year
+        c = colors[i % len(colors)]
+        ax.plot(t, density, color=c, lw=1.5,
+                label=f'{r.strategy_name}/{r.rule_name}')
+
+    ax.set_xlabel('Years into simulated path')
+    ax.set_ylabel(f'Mean events per {window_days}-day window (avg across paths)')
+    ax.set_title(title or f'Size-Change Event Density Over Simulated Time\n'
+                           f'(rolling {window_days}-day window)')
+    ax.legend(fontsize=9)
+    ax.grid(alpha=0.3)
+    return ax
+
+
+def plot_historical_events(
+    historical_returns,
+    rule,
+    strategy_name: str,
+    initial_capital: float,
+    ax=None,
+    title: str | None = None,
+):
+    """
+    Apply the stop rule to the actual historical return series and plot:
+      - Normalised equity curve
+      - Position size as shaded area (right axis)
+      - CUT events as red downward triangles
+      - RAISE events as green upward triangles
+
+    This is the most intuitive diagnostic for two questions:
+      1. Validation: did the rule fire during known real stress periods?
+         (2008 GFC, March 2020 COVID, 2022 rate shock)
+      2. Whipsaw detection: are cuts and raises clustered tightly together
+         in short windows? That signals the rule is reacting to noise
+         rather than genuine drawdowns.
+
+    Parameters
+    ----------
+    historical_returns : pd.Series
+        Aligned daily returns for one strategy (same series used in simulation).
+    rule : StopRule
+        Fresh rule instance — will be run through the engine on the full history.
+    strategy_name : str
+    initial_capital : float
+    """
+    from .engine import run_backtest
+
+    returns = historical_returns.values
+    dates = historical_returns.index
+    single_path = returns[np.newaxis, :]
+
+    res = run_backtest(single_path, rule, strategy_name, initial_capital)
+    eq = res.equity_curves[0]       # length n_days+1
+    sizes = res.position_sizes[0]   # length n_days
+    eq_norm = eq / eq[0]            # normalise to 1.0
+
+    # Detect size-change events.
+    prev = np.concatenate([[1.0], sizes[:-1]])
+    cuts   = np.where(sizes < prev)[0]
+    raises = np.where(sizes > prev)[0]
+
+    if ax is None:
+        _, ax = plt.subplots(figsize=(14, 6))
+
+    # Equity curve on left axis.
+    ax.plot(dates, eq_norm[:-1], color='black', lw=1.2,
+            label='Equity (normalised)', zorder=3)
+    ax.axhline(1.0, color='k', ls=':', alpha=0.3)
+
+    # Position size as shaded area on right axis.
+    ax2 = ax.twinx()
+    ax2.fill_between(dates, sizes, alpha=0.12, color='steelblue')
+    ax2.plot(dates, sizes, color='steelblue', lw=0.8, alpha=0.5,
+             label='Position size')
+    ax2.set_ylabel('Position size', color='steelblue')
+    ax2.set_ylim(-0.1, 1.4)
+    ax2.tick_params(axis='y', labelcolor='steelblue')
+    ax2.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f'{y:.0%}'))
+
+    # Mark cut and raise events.
+    if len(cuts):
+        ax.scatter(dates[cuts], eq_norm[cuts],
+                   color='tab:red', marker='v', s=70, zorder=5,
+                   label=f'CUT ({len(cuts)})')
+    if len(raises):
+        ax.scatter(dates[raises], eq_norm[raises],
+                   color='tab:green', marker='^', s=70, zorder=5,
+                   label=f'RAISE ({len(raises)})')
+
+    ax.set_xlabel('Date')
+    ax.set_ylabel('Equity (normalised to 1.0 at inception)')
+    ax.set_title(title or f'{strategy_name} / {rule.name}: Historical Stop Events')
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f'{y:.2f}'))
+    ax.grid(alpha=0.3)
+
+    lines1, labels1 = ax.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax.legend(lines1 + lines2, labels1 + labels2, fontsize=9, loc='upper left')
+
+    # Print event log for inspection.
+    years = len(dates) / 252
+    print(f"\n{strategy_name} / {rule.name}  ({years:.1f} years of history)")
+    print(f"  Cuts:   {len(cuts)}  ({len(cuts)/years:.1f}/yr)")
+    print(f"  Raises: {len(raises)}  ({len(raises)/years:.1f}/yr)")
+    if len(cuts):
+        print(f"  First cut: {dates[cuts[0]].date()}   size → {sizes[cuts[0]]:.0%}")
+        print(f"  Last cut:  {dates[cuts[-1]].date()}  size → {sizes[cuts[-1]]:.0%}")
+    if len(cuts) > 1:
+        gaps = np.diff(cuts)
+        short_gaps = (gaps < 10).sum()
+        print(f"  Mean days between cuts: {gaps.mean():.0f}")
+        print(f"  Cuts within 10 days of previous cut: {short_gaps} "
+              f"({'⚠ possible whipsaw' if short_gaps > 2 else 'OK'})")
+
+    return ax, ax2
+
+
 def institutional_summary(
     results: Sequence[BacktestResult],
     dd_thresholds: Sequence[float] = (0.10, 0.15, 0.20, 0.30),
