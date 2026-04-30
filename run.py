@@ -253,3 +253,29 @@ sens_p.to_csv('sensitivity_params.csv', index=False)
 summary.to_csv('institutional_summary.csv', index=False)
 activity.to_csv('stop_activity.csv', index=False)
 print("\nAll CSVs saved in the current working directory.")
+
+from src import (plot_calmar_bar, plot_dd_breach_heatmap,
+                 plot_rolling_return_violin, plot_stop_activity_bar,
+                 plot_conditional_diverging, conditional_comparison)
+
+# Headline charts (opening section)
+fig, ax = plt.subplots(figsize=(13, 5))
+plot_calmar_bar(all_results, ax=ax)
+
+plot_dd_breach_heatmap(all_results)   # creates its own figure
+
+fig, ax = plt.subplots(figsize=(15, 6))
+plot_rolling_return_violin(all_results, ax=ax)
+
+# Operational cost
+fig, ax = plt.subplots(figsize=(14, 5))
+plot_stop_activity_bar(all_results, ax=ax)
+
+# When does the stop help?
+cond = conditional_comparison(
+    results[('US Ten Stocks', 'two_red')],
+    results[('US Ten Stocks', 'baseline')],
+    bucket_by='worst_30d', n_buckets=5)
+fig, ax = plt.subplots(figsize=(9, 4))
+plot_conditional_diverging(cond, ax=ax,
+    title='US Ten Stocks: TwoRed vs NoStop by market regime')
