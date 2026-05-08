@@ -65,7 +65,7 @@ if _HAS_NUMBA:
                     cur_size = level_sizes[triggered]
                     trough = eq
                 elif reentry_recovery > 0.0 and cur_level >= 0:
-                    if eq - trough >= reentry_recovery:
+                    if level_dds[cur_level] - dd >= reentry_recovery:
                         new_level = -1
                         for i in range(n_levels):
                             if dd >= level_dds[i]:

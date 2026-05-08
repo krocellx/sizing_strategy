@@ -9,7 +9,7 @@ under realistic market dynamics. The testing rule in scope:
 - Cut position to 70% when drawdown from HWM reaches **$400k**
 - Cut further to 40% at **$1.1m** drawdown
 - Fully exit at **$2m** drawdown
-- Step back up one level if equity recovers **$300k** from its trough
+- Step back up one level if the drawdown retreats **$300k** below the current trigger threshold
 
 This rule is path-dependent — its behavior depends on the *sequence* of returns,
 not just the distribution — so back-testing on a single historical series is
