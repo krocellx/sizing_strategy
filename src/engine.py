@@ -9,7 +9,7 @@ stop rules are path-dependent (state depends on history).
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass
-from .stop_rules import StopRule, TrailingStopRule, NoStop
+from .stop_rules import StopRule, TrailingStopRule, NoStop, VolScaledTrailingStop, RatioVolScaledTrailingStop
 
 try:
     from numba import njit
@@ -33,7 +33,6 @@ if _HAS_NUMBA:
             eq = initial_capital
             equity[p, 0] = eq
             hwm = eq
-            trough = eq
             cur_size = 1.0
             cur_level = -1
 
@@ -44,40 +43,379 @@ if _HAS_NUMBA:
 
                 if eq > hwm:
                     hwm = eq
-                    trough = eq
                     cur_size = 1.0
                     cur_level = -1
                     continue
 
-                if eq < trough:
-                    trough = eq
-
                 dd = hwm - eq
-                triggered = -1
+
+                # Single scan for both ratchet-down and re-entry.
+                warranted = -1
                 for i in range(n_levels):
                     if dd >= level_dds[i]:
-                        triggered = i
+                        warranted = i
                     else:
                         break
 
-                if triggered > cur_level:
-                    cur_level = triggered
-                    cur_size = level_sizes[triggered]
-                    trough = eq
+                if warranted > cur_level:
+                    cur_level = warranted
+                    cur_size = level_sizes[warranted]
                 elif reentry_recovery > 0.0 and cur_level >= 0:
-                    if level_dds[cur_level] - dd >= reentry_recovery:
-                        new_level = -1
-                        for i in range(n_levels):
-                            if dd >= level_dds[i]:
-                                new_level = i
-                            else:
-                                break
-                        if new_level < cur_level:
-                            cur_level = new_level
-                            cur_size = 1.0 if new_level == -1 else level_sizes[new_level]
-                            trough = eq
+                    # Threshold-based re-entry: DD retreated reentry_recovery
+                    # below the current level's trigger.
+                    recovery_from_trigger = level_dds[cur_level] - dd
+                    if recovery_from_trigger >= reentry_recovery and warranted < cur_level:
+                        cur_level = warranted
+                        cur_size = 1.0 if warranted == -1 else level_sizes[warranted]
 
         return equity, sizes
+
+
+    @njit(cache=True)
+    def _vol_scaled_loop(returns, initial_capital,
+                         base_level_dds, base_level_sizes,
+                         base_reentry_recovery, reference_vol,
+                         vol_window_days, refresh_mode_code,
+                         monthly_days, seed_buffer):
+        """
+        Numba-jitted backtest for VolScaledTrailingStop.
+
+        refresh_mode_code: 0 = 'monthly', 1 = 'hwm'
+
+        seed_buffer: array of length up to vol_window_days containing the
+            initial daily returns to seed the vol estimator. Pass a zero-
+            length array if no seed.
+
+        Also returns vol_mult_log: (n_paths, n_days) array of the vol_mult
+        active when each day's size was decided (for diagnostics).
+        """
+        n_paths, n_days = returns.shape
+        n_levels = base_level_dds.shape[0]
+        equity = np.empty((n_paths, n_days + 1))
+        sizes = np.empty((n_paths, n_days))
+        vol_mult_log = np.empty((n_paths, n_days))
+
+        for p in range(n_paths):
+            # Initialise ring buffer with seed.
+            # Use float64 to match numba's default; size = vol_window_days.
+            buf = np.zeros(vol_window_days, dtype=np.float64)
+            buf_filled = 0   # how many real values are in buf
+            buf_head = 0     # next write position
+
+            n_seed = seed_buffer.shape[0]
+            if n_seed > 0:
+                take = min(n_seed, vol_window_days)
+                for i in range(take):
+                    buf[i] = seed_buffer[n_seed - take + i]
+                buf_filled = take
+                buf_head = take % vol_window_days
+
+            # Compute initial vol_mult from seed (or 1.0 if no seed/too few obs).
+            if buf_filled >= 2:
+                mean = 0.0
+                for i in range(buf_filled):
+                    mean += buf[i]
+                mean /= buf_filled
+                var = 0.0
+                for i in range(buf_filled):
+                    diff = buf[i] - mean
+                    var += diff * diff
+                var /= (buf_filled - 1)
+                vol = np.sqrt(var) * np.sqrt(252.0)
+                vol_mult = vol / reference_vol
+            else:
+                vol_mult = 1.0
+
+            eq = initial_capital
+            equity[p, 0] = eq
+            hwm = eq
+            cur_size = 1.0
+            cur_level = -1
+            days_since_refresh = 0
+
+            for t in range(n_days):
+                # 1. Observe today's return — add to ring buffer.
+                r = returns[p, t]
+                buf[buf_head] = r
+                buf_head = (buf_head + 1) % vol_window_days
+                if buf_filled < vol_window_days:
+                    buf_filled += 1
+                days_since_refresh += 1
+
+                # 2. Monthly refresh check.
+                if refresh_mode_code == 0 and days_since_refresh >= monthly_days:
+                    if buf_filled >= 2:
+                        mean = 0.0
+                        for i in range(buf_filled):
+                            mean += buf[i]
+                        mean /= buf_filled
+                        var = 0.0
+                        for i in range(buf_filled):
+                            diff = buf[i] - mean
+                            var += diff * diff
+                        var /= (buf_filled - 1)
+                        vol = np.sqrt(var) * np.sqrt(252.0)
+                        vol_mult = vol / reference_vol
+                    days_since_refresh = 0
+
+                # 3. Record size decided for today.
+                sizes[p, t] = cur_size
+                vol_mult_log[p, t] = vol_mult
+
+                # 4. Apply today's PnL.
+                eq = eq * (1.0 + cur_size * r)
+                equity[p, t + 1] = eq
+
+                # 5. Update HWM (with optional vol_mult refresh on new high).
+                if eq > hwm:
+                    hwm = eq
+                    trough = eq
+                    cur_size = 1.0
+                    cur_level = -1
+                    if refresh_mode_code == 1 and buf_filled >= 2:
+                        mean = 0.0
+                        for i in range(buf_filled):
+                            mean += buf[i]
+                        mean /= buf_filled
+                        var = 0.0
+                        for i in range(buf_filled):
+                            diff = buf[i] - mean
+                            var += diff * diff
+                        var /= (buf_filled - 1)
+                        vol = np.sqrt(var) * np.sqrt(252.0)
+                        vol_mult = vol / reference_vol
+                        days_since_refresh = 0
+                    continue
+
+                dd = hwm - eq
+                active_reentry = base_reentry_recovery * vol_mult
+
+                # Single scan for both ratchet-down and re-entry.
+                warranted = -1
+                for i in range(n_levels):
+                    if dd >= base_level_dds[i] * vol_mult:
+                        warranted = i
+                    else:
+                        break
+
+                if warranted > cur_level:
+                    cur_level = warranted
+                    cur_size = base_level_sizes[warranted]
+                elif active_reentry > 0.0 and cur_level >= 0:
+                    # Threshold-based re-entry.
+                    recovery_from_trigger = base_level_dds[cur_level] * vol_mult - dd
+                    if recovery_from_trigger >= active_reentry and warranted < cur_level:
+                        cur_level = warranted
+                        cur_size = 1.0 if warranted == -1 else base_level_sizes[warranted]
+
+        return equity, sizes, vol_mult_log
+
+
+    @njit(cache=True)
+    def _ratio_vol_scaled_loop(returns, initial_capital,
+                               base_level_dds, base_level_sizes,
+                               base_reentry_recovery,
+                               short_window, long_window,
+                               refresh_mode_code, monthly_days,
+                               vol_mult_floor, vol_mult_cap):
+        """
+        Numba fast path for RatioVolScaledTrailingStop.
+
+        vol_mult = clamp(σ_short / σ_long, floor, cap)
+
+        During warmup (in-path days < long_window), vol_mult = 1.0.
+        After warmup: ratio activates at the next refresh point (snap).
+
+        refresh_mode_code: 0 = monthly, 1 = hwm
+        No seed buffer needed — the warmup period handles initialisation.
+        """
+        n_paths, n_days = returns.shape
+        n_levels = base_level_dds.shape[0]
+        equity = np.empty((n_paths, n_days + 1))
+        sizes = np.empty((n_paths, n_days))
+        vol_mult_log = np.empty((n_paths, n_days))
+
+        for p in range(n_paths):
+            # Ring buffers for short and long windows.
+            short_buf = np.zeros(short_window)
+            long_buf = np.zeros(long_window)
+            short_filled = 0
+            long_filled = 0
+            short_head = 0
+            long_head = 0
+
+            vol_mult = 1.0
+            warmed_up = False
+            days_since_refresh = 0
+            in_path_days = 0
+
+            eq = initial_capital
+            equity[p, 0] = eq
+            hwm = eq
+            cur_size = 1.0
+            cur_level = -1
+
+            for t in range(n_days):
+                r = returns[p, t]
+
+                # --- observe_return: update ring buffers ---
+                short_buf[short_head] = r
+                short_head = (short_head + 1) % short_window
+                if short_filled < short_window:
+                    short_filled += 1
+
+                long_buf[long_head] = r
+                long_head = (long_head + 1) % long_window
+                if long_filled < long_window:
+                    long_filled += 1
+
+                in_path_days += 1
+                days_since_refresh += 1
+
+                # Check warmup snap: activate on day long_window.
+                if not warmed_up and in_path_days >= long_window:
+                    warmed_up = True
+                    # Compute vol_mult immediately (same as Python snap).
+                    # Use full buffers at this point.
+                    mean_s = 0.0
+                    for i in range(short_filled):
+                        mean_s += short_buf[i]
+                    mean_s /= short_filled
+                    var_s = 0.0
+                    for i in range(short_filled):
+                        d = short_buf[i] - mean_s
+                        var_s += d * d
+                    var_s /= (short_filled - 1)
+                    sig_short = np.sqrt(var_s) * np.sqrt(252.0)
+
+                    mean_l = 0.0
+                    for i in range(long_filled):
+                        mean_l += long_buf[i]
+                    mean_l /= long_filled
+                    var_l = 0.0
+                    for i in range(long_filled):
+                        d = long_buf[i] - mean_l
+                        var_l += d * d
+                    var_l /= (long_filled - 1)
+                    sig_long = np.sqrt(var_l) * np.sqrt(252.0)
+
+                    if sig_long > 0.0:
+                        raw = sig_short / sig_long
+                        if raw < vol_mult_floor:
+                            raw = vol_mult_floor
+                        if raw > vol_mult_cap:
+                            raw = vol_mult_cap
+                        vol_mult = raw
+                    # Reset counter so next monthly refresh fires in monthly_days.
+                    days_since_refresh = 0
+
+                # Monthly refresh (only meaningful after warmup).
+                if (refresh_mode_code == 0
+                        and days_since_refresh >= monthly_days
+                        and warmed_up):
+                    # Compute σ_short.
+                    mean_s = 0.0
+                    for i in range(short_filled):
+                        mean_s += short_buf[i]
+                    mean_s /= short_filled
+                    var_s = 0.0
+                    for i in range(short_filled):
+                        d = short_buf[i] - mean_s
+                        var_s += d * d
+                    var_s /= (short_filled - 1)
+                    sig_short = np.sqrt(var_s) * np.sqrt(252.0)
+
+                    # Compute σ_long.
+                    mean_l = 0.0
+                    for i in range(long_filled):
+                        mean_l += long_buf[i]
+                    mean_l /= long_filled
+                    var_l = 0.0
+                    for i in range(long_filled):
+                        d = long_buf[i] - mean_l
+                        var_l += d * d
+                    var_l /= (long_filled - 1)
+                    sig_long = np.sqrt(var_l) * np.sqrt(252.0)
+
+                    if sig_long > 0.0:
+                        raw = sig_short / sig_long
+                        if raw < vol_mult_floor:
+                            raw = vol_mult_floor
+                        if raw > vol_mult_cap:
+                            raw = vol_mult_cap
+                        vol_mult = raw
+                    days_since_refresh = 0
+
+                # Record size and vol_mult for today.
+                sizes[p, t] = cur_size
+                vol_mult_log[p, t] = vol_mult
+
+                # Apply today's PnL.
+                eq = eq * (1.0 + cur_size * r)
+                equity[p, t + 1] = eq
+
+                # HWM update.
+                if eq > hwm:
+                    hwm = eq
+                    trough = eq
+                    cur_size = 1.0
+                    cur_level = -1
+                    # HWM refresh.
+                    if refresh_mode_code == 1 and warmed_up and short_filled >= 2:
+                        mean_s = 0.0
+                        for i in range(short_filled):
+                            mean_s += short_buf[i]
+                        mean_s /= short_filled
+                        var_s = 0.0
+                        for i in range(short_filled):
+                            d = short_buf[i] - mean_s
+                            var_s += d * d
+                        var_s /= (short_filled - 1)
+                        sig_short = np.sqrt(var_s) * np.sqrt(252.0)
+
+                        mean_l = 0.0
+                        for i in range(long_filled):
+                            mean_l += long_buf[i]
+                        mean_l /= long_filled
+                        var_l = 0.0
+                        for i in range(long_filled):
+                            d = long_buf[i] - mean_l
+                            var_l += d * d
+                        var_l /= (long_filled - 1)
+                        sig_long = np.sqrt(var_l) * np.sqrt(252.0)
+
+                        if sig_long > 0.0:
+                            raw = sig_short / sig_long
+                            if raw < vol_mult_floor:
+                                raw = vol_mult_floor
+                            if raw > vol_mult_cap:
+                                raw = vol_mult_cap
+                            vol_mult = raw
+                        days_since_refresh = 0
+                    continue
+
+                dd = hwm - eq
+                active_reentry = base_reentry_recovery * vol_mult
+
+                # Single scan for both ratchet-down and re-entry.
+                warranted = -1
+                for i in range(n_levels):
+                    if dd >= base_level_dds[i] * vol_mult:
+                        warranted = i
+                    else:
+                        break
+
+                if warranted > cur_level:
+                    cur_level = warranted
+                    cur_size = base_level_sizes[warranted]
+                elif active_reentry > 0.0 and cur_level >= 0:
+                    # Threshold-based re-entry.
+                    recovery_from_trigger = base_level_dds[cur_level] * vol_mult - dd
+                    if recovery_from_trigger >= active_reentry and warranted < cur_level:
+                        cur_level = warranted
+                        cur_size = 1.0 if warranted == -1 else base_level_sizes[warranted]
+
+        return equity, sizes, vol_mult_log
 
 
 @dataclass
@@ -87,6 +425,7 @@ class BacktestResult:
     equity_curves: np.ndarray   # (n_paths, path_length + 1), starts at initial_capital
     position_sizes: np.ndarray  # (n_paths, path_length), size used each day
     initial_capital: float
+    vol_mult_log: np.ndarray | None = None  # (n_paths, path_length), for vol-scaled rules
 
     @property
     def terminal_wealth(self) -> np.ndarray:
@@ -186,28 +525,66 @@ def run_backtest(
         )
         return BacktestResult(strategy_name, rule.name, equity, sizes, initial_capital)
 
+    # Fast path: VolScaledTrailingStop via numba.
+    if _HAS_NUMBA and isinstance(rule, VolScaledTrailingStop):
+        sorted_levels = sorted(rule.base_levels, key=lambda x: x[0])
+        base_level_dds = np.array([l[0] for l in sorted_levels], dtype=np.float64)
+        base_level_sizes = np.array([l[1] for l in sorted_levels], dtype=np.float64)
+        refresh_mode_code = 0 if rule.refresh_mode == 'monthly' else 1
+        seed = (np.asarray(rule.initial_daily_returns, dtype=np.float64)
+                if rule.initial_daily_returns is not None
+                else np.zeros(0, dtype=np.float64))
+        equity, sizes, vol_mult_log = _vol_scaled_loop(
+            returns, float(initial_capital),
+            base_level_dds, base_level_sizes,
+            float(rule.base_reentry_recovery), float(rule.reference_vol),
+            int(rule.vol_window_days), refresh_mode_code,
+            int(rule.monthly_days), seed,
+        )
+        return BacktestResult(strategy_name, rule.name, equity, sizes,
+                              initial_capital, vol_mult_log=vol_mult_log)
+
+    # Fast path: RatioVolScaledTrailingStop via numba.
+    if _HAS_NUMBA and isinstance(rule, RatioVolScaledTrailingStop):
+        sorted_levels = sorted(rule.base_levels, key=lambda x: x[0])
+        base_level_dds = np.array([l[0] for l in sorted_levels], dtype=np.float64)
+        base_level_sizes = np.array([l[1] for l in sorted_levels], dtype=np.float64)
+        refresh_mode_code = 0 if rule.refresh_mode == 'monthly' else 1
+        equity, sizes, vol_mult_log = _ratio_vol_scaled_loop(
+            returns, float(initial_capital),
+            base_level_dds, base_level_sizes,
+            float(rule.base_reentry_recovery),
+            int(rule.short_window), int(rule.long_window),
+            refresh_mode_code, int(rule.monthly_days),
+            float(rule.vol_mult_floor), float(rule.vol_mult_cap),
+        )
+        return BacktestResult(strategy_name, rule.name, equity, sizes,
+                              initial_capital, vol_mult_log=vol_mult_log)
+
     # Generic fallback: Python loop, works for any StopRule subclass.
     equity = np.empty((n_paths, path_length + 1))
     equity[:, 0] = initial_capital
     sizes = np.empty((n_paths, path_length))
 
-    # We need to drive the rule per-path because internal state is per-path.
-    # The OUTER loop is over paths; the INNER loop is over days. This is the
-    # opposite of what you'd want for pure vectorization, but stop rules
-    # are inherently sequential within a path.
-    #
-    # For 10k paths x 1260 days this is ~12.6M rule.update() calls. On modern
-    # hardware that's a few seconds for simple rules. If it ever becomes a
-    # bottleneck, the trailing-stop logic could be re-implemented in numba.
+    # Optional vol_mult log for diagnostic plots when the rule tracks vol.
+    is_vol_scaled = isinstance(rule, (VolScaledTrailingStop, RatioVolScaledTrailingStop))
+    vol_mult_log = np.empty((n_paths, path_length)) if is_vol_scaled else None
+
     for p in range(n_paths):
         rule.reset(initial_capital)
         eq = initial_capital
         size = 1.0
         for t in range(path_length):
+            r = strategy_returns_paths[p, t]
+            # observe_return first (updates vol buffer and triggers warmup snap).
+            rule.observe_return(r)
             sizes[p, t] = size
-            eq = eq * (1 + size * strategy_returns_paths[p, t])
+            eq = eq * (1 + size * r)
             equity[p, t + 1] = eq
             size = rule.update(eq)
+            # Log vol_mult AFTER update() — same timing as numba fast path.
+            if is_vol_scaled:
+                vol_mult_log[p, t] = rule.current_vol_mult
 
     return BacktestResult(
         strategy_name=strategy_name,
@@ -215,6 +592,7 @@ def run_backtest(
         equity_curves=equity,
         position_sizes=sizes,
         initial_capital=initial_capital,
+        vol_mult_log=vol_mult_log,
     )
 
 
