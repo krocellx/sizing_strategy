@@ -169,7 +169,6 @@ if _HAS_NUMBA:
                 # 5. Update HWM (with optional vol_mult refresh on new high).
                 if eq > hwm:
                     hwm = eq
-                    trough = eq
                     cur_size = 1.0
                     cur_level = -1
                     if refresh_mode_code == 1 and buf_filled >= 2:
@@ -357,7 +356,6 @@ if _HAS_NUMBA:
                 # HWM update.
                 if eq > hwm:
                     hwm = eq
-                    trough = eq
                     cur_size = 1.0
                     cur_level = -1
                     # HWM refresh.

@@ -77,9 +77,8 @@ class TrailingStopRule(StopRule):
         ]
         reentry_recovery = 300_000
 
-    Re-entry: tracks the lowest equity reached while in a reduced state.
-    If equity recovers by `reentry_recovery` from that trough AND drawdown
-    from HWM is now below the previous level's trigger, step back up.
+    Re-entry: if equity recovers such that drawdown retreats reentry_recovery
+    below the level's trigger threshold, step back up one level.
     """
 
     levels: list[tuple[float, float]]
@@ -87,7 +86,6 @@ class TrailingStopRule(StopRule):
     label: str = "TrailingStop"
 
     _hwm: float = field(default=0.0, init=False)
-    _trough: float = field(default=0.0, init=False)
     _current_size: float = field(default=1.0, init=False)
     _current_level_idx: int = field(default=-1, init=False)
     _sorted_levels: list = field(default_factory=list, init=False)
@@ -212,7 +210,6 @@ class VolScaledTrailingStop(StopRule):
     label: str = "VolScaledTrailingStop"
 
     _hwm: float = field(default=0.0, init=False)
-    _trough: float = field(default=0.0, init=False)
     _current_size: float = field(default=1.0, init=False)
     _current_level_idx: int = field(default=-1, init=False)
     _sorted_base_levels: list = field(default_factory=list, init=False)
@@ -234,7 +231,6 @@ class VolScaledTrailingStop(StopRule):
 
     def reset(self, initial_capital: float) -> None:
         self._hwm = initial_capital
-        self._trough = initial_capital
         self._current_size = 1.0
         self._current_level_idx = -1
 
@@ -392,7 +388,6 @@ class RatioVolScaledTrailingStop(StopRule):
 
     # Internal state
     _hwm: float = field(default=0.0, init=False)
-    _trough: float = field(default=0.0, init=False)
     _current_size: float = field(default=1.0, init=False)
     _current_level_idx: int = field(default=-1, init=False)
     _sorted_base_levels: list = field(default_factory=list, init=False)
@@ -419,7 +414,6 @@ class RatioVolScaledTrailingStop(StopRule):
 
     def reset(self, initial_capital: float) -> None:
         self._hwm = initial_capital
-        self._trough = initial_capital
         self._current_size = 1.0
         self._current_level_idx = -1
         self._vol_mult = 1.0
