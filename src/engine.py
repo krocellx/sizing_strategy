@@ -424,6 +424,7 @@ class BacktestResult:
     position_sizes: np.ndarray  # (n_paths, path_length), size used each day
     initial_capital: float
     vol_mult_log: np.ndarray | None = None  # (n_paths, path_length), for vol-scaled rules
+    transaction_cost_bps: float = 0.0       # one-way cost applied, for reference
 
     @property
     def terminal_wealth(self) -> np.ndarray:
@@ -476,11 +477,79 @@ class BacktestResult:
         })
 
 
+def _apply_transaction_costs(
+    equity: np.ndarray,
+    sizes: np.ndarray,
+    cost: float,
+) -> np.ndarray:
+    """
+    Apply one-way transaction costs to an equity curve array in-place.
+
+    Two cost events per path:
+      1. Intra-period: on every day where position size changes, deduct
+         |Δsize| × equity_eod × cost from equity. Applied end-of-day
+         (after the day's return, before recording equity[t+1]).
+      2. Terminal: on the final day, deduct current_size × terminal_equity
+         × cost to reflect liquidation of the remaining position. This
+         levels the playing field: NoStop pays its exit cost at the end,
+         stop rules that already exited (size=0) pay nothing extra.
+
+    Parameters
+    ----------
+    equity : (n_paths, path_length+1) — modified IN PLACE
+    sizes  : (n_paths, path_length)
+    cost   : one-way cost as a fraction (e.g. 0.0005 for 5bps)
+
+    Returns
+    -------
+    equity (same array, modified in place for efficiency)
+    """
+    if cost == 0.0:
+        return equity
+
+    n_paths, n_days = sizes.shape
+
+    # --- Intra-period costs ---
+    # Δsize[t] = sizes[t] - sizes[t-1], with sizes[-1] = 1.0 (full at start).
+    prev_sizes = np.concatenate(
+        [np.ones((n_paths, 1)), sizes[:, :-1]], axis=1
+    )
+    delta = np.abs(sizes - prev_sizes)          # (n_paths, n_days)
+    # Equity after day t's return is equity[:, t+1] before cost adjustment.
+    # Cost is applied to that post-return equity.
+    cost_amount = delta * equity[:, 1:] * cost  # (n_paths, n_days)
+
+    # Propagate: a cost on day t reduces equity on all subsequent days
+    # because the compounding base is lower. We do this correctly by
+    # working forward: subtract cost from equity[t+1], then let the
+    # subsequent returns compound from the reduced base.
+    # Vectorised forward propagation using cumulative cost ratios:
+    #   equity_net[t] = equity_gross[t] × ∏_{s≤t} (1 - cost_s/equity_gross[s])
+    # But that's O(n²) per path. Instead, adjust equity in-place iteratively
+    # using a running cost multiplier — cheap because cost events are sparse.
+    for t in range(n_days):
+        col_cost = cost_amount[:, t]            # (n_paths,)
+        has_cost = col_cost > 0
+        if has_cost.any():
+            equity[has_cost, t + 1:] -= col_cost[has_cost, np.newaxis]
+
+    # --- Terminal liquidation cost ---
+    # Everyone pays cost to unwind their remaining position on the last day.
+    # Stop rules already at size=0 pay nothing (they liquidated during the run).
+    terminal_sizes = sizes[:, -1]               # (n_paths,)
+    terminal_equity = equity[:, -1]             # (n_paths,)
+    terminal_cost = terminal_sizes * terminal_equity * cost
+    equity[:, -1] -= terminal_cost
+
+    return equity
+
+
 def run_backtest(
     strategy_returns_paths: np.ndarray,
     rule: StopRule,
     strategy_name: str,
     initial_capital: float = 10_000_000.0,
+    transaction_cost_bps: float = 0.0,
 ) -> BacktestResult:
     """
     Apply a stop rule to a matrix of simulated returns.
@@ -489,13 +558,16 @@ def run_backtest(
     ----------
     strategy_returns_paths : np.ndarray, shape (n_paths, path_length)
         Daily returns for one strategy across all simulated paths.
-        Get this from simulation.generate_scenarios()['paths'][strategy_name].
     rule : StopRule
         The position-sizing / stop rule to apply.
     strategy_name : str
         For labeling results.
     initial_capital : float
         Starting equity per path (default $10m).
+    transaction_cost_bps : float
+        One-way transaction cost in basis points (default 0).
+        Applied on every size change (intra-period) and on the final
+        day's remaining position (terminal liquidation). 5bps = 0.05.
 
     Returns
     -------
@@ -503,6 +575,7 @@ def run_backtest(
     """
     n_paths, path_length = strategy_returns_paths.shape
     returns = np.ascontiguousarray(strategy_returns_paths, dtype=np.float64)
+    cost = transaction_cost_bps / 10_000.0  # convert bps to fraction
 
     # Fast path: NoStop is trivial.
     if isinstance(rule, NoStop):
@@ -510,7 +583,9 @@ def run_backtest(
         equity[:, 0] = initial_capital
         equity[:, 1:] = initial_capital * np.cumprod(1.0 + returns, axis=1)
         sizes = np.ones((n_paths, path_length))
-        return BacktestResult(strategy_name, rule.name, equity, sizes, initial_capital)
+        _apply_transaction_costs(equity, sizes, cost)
+        return BacktestResult(strategy_name, rule.name, equity, sizes,
+                              initial_capital, transaction_cost_bps=transaction_cost_bps)
 
     # Fast path: TrailingStopRule via numba.
     if _HAS_NUMBA and isinstance(rule, TrailingStopRule):
@@ -521,7 +596,9 @@ def run_backtest(
             returns, float(initial_capital),
             level_dds, level_sizes, float(rule.reentry_recovery),
         )
-        return BacktestResult(strategy_name, rule.name, equity, sizes, initial_capital)
+        _apply_transaction_costs(equity, sizes, cost)
+        return BacktestResult(strategy_name, rule.name, equity, sizes,
+                              initial_capital, transaction_cost_bps=transaction_cost_bps)
 
     # Fast path: VolScaledTrailingStop via numba.
     if _HAS_NUMBA and isinstance(rule, VolScaledTrailingStop):
@@ -539,8 +616,10 @@ def run_backtest(
             int(rule.vol_window_days), refresh_mode_code,
             int(rule.monthly_days), seed,
         )
+        _apply_transaction_costs(equity, sizes, cost)
         return BacktestResult(strategy_name, rule.name, equity, sizes,
-                              initial_capital, vol_mult_log=vol_mult_log)
+                              initial_capital, vol_mult_log=vol_mult_log,
+                              transaction_cost_bps=transaction_cost_bps)
 
     # Fast path: RatioVolScaledTrailingStop via numba.
     if _HAS_NUMBA and isinstance(rule, RatioVolScaledTrailingStop):
@@ -556,8 +635,10 @@ def run_backtest(
             refresh_mode_code, int(rule.monthly_days),
             float(rule.vol_mult_floor), float(rule.vol_mult_cap),
         )
+        _apply_transaction_costs(equity, sizes, cost)
         return BacktestResult(strategy_name, rule.name, equity, sizes,
-                              initial_capital, vol_mult_log=vol_mult_log)
+                              initial_capital, vol_mult_log=vol_mult_log,
+                              transaction_cost_bps=transaction_cost_bps)
 
     # Generic fallback: Python loop, works for any StopRule subclass.
     equity = np.empty((n_paths, path_length + 1))
@@ -574,15 +655,16 @@ def run_backtest(
         size = 1.0
         for t in range(path_length):
             r = strategy_returns_paths[p, t]
-            # observe_return first (updates vol buffer and triggers warmup snap).
             rule.observe_return(r)
             sizes[p, t] = size
             eq = eq * (1 + size * r)
             equity[p, t + 1] = eq
             size = rule.update(eq)
-            # Log vol_mult AFTER update() — same timing as numba fast path.
             if is_vol_scaled:
                 vol_mult_log[p, t] = rule.current_vol_mult
+
+    # Apply transaction costs as post-processing (same as numba fast paths).
+    _apply_transaction_costs(equity, sizes, cost)
 
     return BacktestResult(
         strategy_name=strategy_name,
@@ -591,6 +673,7 @@ def run_backtest(
         position_sizes=sizes,
         initial_capital=initial_capital,
         vol_mult_log=vol_mult_log,
+        transaction_cost_bps=transaction_cost_bps,
     )
 
 
