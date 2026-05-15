@@ -821,3 +821,93 @@ def institutional_summary(
             row[f'P(maxDD>{int(t*100)}%)'] = float((dd_pct > t).mean())
         rows.append(row)
     return pd.DataFrame(rows)
+
+def plot_survival_curve(results_dict, strategies, rules, 
+                        periods_per_year=252, ax=None):
+    """
+    % of paths still active (size > 0) over time.
+    Once size=0, path is permanently dead — so this is a true survival curve.
+    """
+    if ax is None:
+        _, ax = plt.subplots(figsize=(12, 5))
+    colors = plt.cm.tab10.colors
+    
+    rule_idx = 0
+    for strat in strategies:
+        for i, rule_key in enumerate(rules):
+            key = (strat, rule_key)
+            if key not in results_dict:
+                continue
+            sizes = results_dict[key].position_sizes  # (n_paths, n_days)
+            # A path is "alive" on day t if it has never been fully stopped out
+            # up to and including day t.
+            ever_stopped = np.maximum.accumulate(sizes == 0.0, axis=1)
+            # Fraction NOT stopped = survival rate
+            survival = (~ever_stopped).mean(axis=0)
+            t = np.arange(len(survival)) / periods_per_year
+            label = f'{strat}/{results_dict[key].rule_name}'
+            ax.plot(t, survival * 100, color=colors[rule_idx % len(colors)],
+                    lw=1.5, label=label)
+            rule_idx += 1
+    
+    ax.set_xlabel('Years')
+    ax.set_ylabel('% of paths still active (never stopped out)')
+    ax.set_ylim(0, 105)
+    ax.set_title('Survival Curve: Paths Remaining Active Over Time')
+    ax.legend(fontsize=8, ncol=2)
+    ax.grid(alpha=0.3)
+    ax.yaxis.set_major_formatter(
+        plt.FuncFormatter(lambda y, _: f'{y:.0f}%'))
+    return ax
+
+
+def plot_stopout_pct(results_dict, strategies, rules, ax=None):
+    """
+    Bar chart: % of paths that hit full stop-out (size=0 at any point),
+    grouped by strategy, bars per rule.
+    
+    results_dict: {(strat, rule_key): BacktestResult}
+    """
+    if ax is None:
+        _, ax = plt.subplots(figsize=(12, 5))
+    
+    colors = plt.cm.tab10.colors
+    rule_labels = list(dict.fromkeys(
+        results_dict[(s, r)].rule_name 
+        for s in strategies for r in rules 
+        if (s, r) in results_dict
+    ))
+    
+    x = np.arange(len(strategies))
+    width = 0.8 / len(rules)
+    
+    for i, rule_key in enumerate(rules):
+        pcts = []
+        for strat in strategies:
+            key = (strat, rule_key)
+            if key in results_dict:
+                sizes = results_dict[key].position_sizes
+                pct = (sizes == 0.0).any(axis=1).mean() * 100
+            else:
+                pct = np.nan
+            pcts.append(pct)
+        
+        offset = (i - len(rules) / 2 + 0.5) * width
+        bars = ax.bar(x + offset, pcts, width * 0.9,
+                      label=results_dict[(strategies[0], rule_key)].rule_name,
+                      color=colors[i % len(colors)], alpha=0.85)
+        for bar, val in zip(bars, pcts):
+            if not np.isnan(val):
+                ax.text(bar.get_x() + bar.get_width()/2,
+                        bar.get_height() + 0.5,
+                        f'{val:.0f}%', ha='center', va='bottom', fontsize=8)
+    
+    ax.set_xticks(x)
+    ax.set_xticklabels(strategies, rotation=15, ha='right')
+    ax.set_ylabel('% of paths with full stop-out')
+    ax.set_ylim(0, 110)
+    ax.axhline(100, color='k', ls=':', alpha=0.3)
+    ax.set_title('Full Stop-Out Rate by Strategy and Rule')
+    ax.legend(fontsize=9)
+    ax.grid(axis='y', alpha=0.3)
+    return ax

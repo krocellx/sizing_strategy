@@ -60,7 +60,7 @@ if _HAS_NUMBA:
                 if warranted > cur_level:
                     cur_level = warranted
                     cur_size = level_sizes[warranted]
-                elif reentry_recovery > 0.0 and cur_level >= 0:
+                elif reentry_recovery > 0.0 and cur_level >= 0 and cur_size > 0.0:
                     # Threshold-based re-entry: DD retreated reentry_recovery
                     # below the current level's trigger.
                     recovery_from_trigger = level_dds[cur_level] - dd
@@ -200,7 +200,7 @@ if _HAS_NUMBA:
                 if warranted > cur_level:
                     cur_level = warranted
                     cur_size = base_level_sizes[warranted]
-                elif active_reentry > 0.0 and cur_level >= 0:
+                elif active_reentry > 0.0 and cur_level >= 0 and cur_size > 0.0:
                     # Threshold-based re-entry.
                     recovery_from_trigger = base_level_dds[cur_level] * vol_mult - dd
                     if recovery_from_trigger >= active_reentry and warranted < cur_level:
@@ -406,7 +406,7 @@ if _HAS_NUMBA:
                 if warranted > cur_level:
                     cur_level = warranted
                     cur_size = base_level_sizes[warranted]
-                elif active_reentry > 0.0 and cur_level >= 0:
+                elif active_reentry > 0.0 and cur_level >= 0 and cur_size > 0.0:
                     # Threshold-based re-entry.
                     recovery_from_trigger = base_level_dds[cur_level] * vol_mult - dd
                     if recovery_from_trigger >= active_reentry and warranted < cur_level:
@@ -423,8 +423,10 @@ class BacktestResult:
     equity_curves: np.ndarray   # (n_paths, path_length + 1), starts at initial_capital
     position_sizes: np.ndarray  # (n_paths, path_length), size used each day
     initial_capital: float
-    vol_mult_log: np.ndarray | None = None  # (n_paths, path_length), for vol-scaled rules
-    transaction_cost_bps: float = 0.0       # one-way cost applied, for reference
+    vol_mult_log: np.ndarray | None = None   # (n_paths, path_length), vol-scaled rules
+    transaction_cost_bps: float = 0.0        # one-way cost applied, for reference
+    cash_flows: np.ndarray | None = None     # (n_paths, n_quarters), NaN if no reset
+    quarterly_reset: bool = False            # whether quarterly reset was applied
 
     @property
     def terminal_wealth(self) -> np.ndarray:
@@ -475,6 +477,66 @@ class BacktestResult:
             'prob_loss': (tr < 0).mean(),
             'prob_50pct_dd': (dd_pct > 0.5).mean(),
         })
+
+
+def _apply_quarterly_reset(
+    equity: np.ndarray,
+    sizes: np.ndarray,
+    initial_capital: float,
+    reset_every_days: int = 63,
+) -> np.ndarray:
+    """
+    Apply quarterly notional resets in-place and return cash flow matrix.
+
+    Rule:
+      - At the end of each quarter (every reset_every_days trading days),
+        check the current position size.
+      - If size == 1.0 (fully invested, no stop active):
+          * Record cash flow = equity - initial_capital
+            (positive = withdrawal, negative = top-up)
+          * Reset equity to initial_capital for ALL subsequent days
+            (the compounding base shifts, but future returns are unchanged)
+          * Reset HWM implicitly — the equity curve restarts from initial_capital
+            so all downstream DD calculations see a fresh reference.
+      - If size < 1.0 or size == 0.0: do nothing. Leave the path untouched.
+
+    Parameters
+    ----------
+    equity : (n_paths, n_days+1), modified IN PLACE
+    sizes  : (n_paths, n_days)
+    initial_capital : float
+    reset_every_days : int, default 63 (~1 quarter)
+
+    Returns
+    -------
+    cash_flows : (n_paths, n_quarters) — cash flow at each quarter-end.
+        Positive = investor receives money (profit taken out).
+        Negative = investor contributes money (loss topped up).
+        NaN = no reset happened this quarter (size was reduced).
+    """
+    n_paths, n_days_plus1 = equity.shape
+    n_days = n_days_plus1 - 1
+    reset_days = list(range(reset_every_days - 1, n_days, reset_every_days))
+    n_quarters = len(reset_days)
+
+    cash_flows = np.full((n_paths, n_quarters), np.nan)
+
+    for p in range(n_paths):
+        for q_idx, t in enumerate(reset_days):
+            # size_today is the size applied during day t.
+            # We check the size AFTER today's return (i.e. equity[t+1] is known).
+            size_at_reset = sizes[p, t]
+            if size_at_reset == 1.0:
+                eq_before = equity[p, t + 1]
+                cf = eq_before - initial_capital
+                cash_flows[p, q_idx] = cf
+                # Shift all future equity values by the reset amount.
+                # equity[t+1] becomes initial_capital; subsequent values
+                # shift by the same delta (returns compound from new base).
+                delta = eq_before - initial_capital
+                equity[p, t + 1:] -= delta
+
+    return cash_flows
 
 
 def _apply_transaction_costs(
@@ -550,6 +612,8 @@ def run_backtest(
     strategy_name: str,
     initial_capital: float = 10_000_000.0,
     transaction_cost_bps: float = 0.0,
+    quarterly_reset: bool = False,
+    reset_every_days: int = 63,
 ) -> BacktestResult:
     """
     Apply a stop rule to a matrix of simulated returns.
@@ -568,6 +632,12 @@ def run_backtest(
         One-way transaction cost in basis points (default 0).
         Applied on every size change (intra-period) and on the final
         day's remaining position (terminal liquidation). 5bps = 0.05.
+    quarterly_reset : bool
+        If True, reset notional to initial_capital at the end of each
+        quarter (every reset_every_days). Only fires when size == 1.0
+        (fully invested). Cash flows are tracked and stored in result.
+    reset_every_days : int
+        Trading days per quarter (default 63).
 
     Returns
     -------
@@ -577,15 +647,33 @@ def run_backtest(
     returns = np.ascontiguousarray(strategy_returns_paths, dtype=np.float64)
     cost = transaction_cost_bps / 10_000.0  # convert bps to fraction
 
+    def _finalise(equity, sizes, vol_mult_log=None):
+        """Apply post-processing and return BacktestResult."""
+        _apply_transaction_costs(equity, sizes, cost)
+        cfs = None
+        if quarterly_reset:
+            cfs = _apply_quarterly_reset(
+                equity, sizes, initial_capital, reset_every_days
+            )
+        return BacktestResult(
+            strategy_name=strategy_name,
+            rule_name=rule.name,
+            equity_curves=equity,
+            position_sizes=sizes,
+            initial_capital=initial_capital,
+            vol_mult_log=vol_mult_log,
+            transaction_cost_bps=transaction_cost_bps,
+            cash_flows=cfs,
+            quarterly_reset=quarterly_reset,
+        )
+
     # Fast path: NoStop is trivial.
     if isinstance(rule, NoStop):
         equity = np.empty((n_paths, path_length + 1))
         equity[:, 0] = initial_capital
         equity[:, 1:] = initial_capital * np.cumprod(1.0 + returns, axis=1)
         sizes = np.ones((n_paths, path_length))
-        _apply_transaction_costs(equity, sizes, cost)
-        return BacktestResult(strategy_name, rule.name, equity, sizes,
-                              initial_capital, transaction_cost_bps=transaction_cost_bps)
+        return _finalise(equity, sizes)
 
     # Fast path: TrailingStopRule via numba.
     if _HAS_NUMBA and isinstance(rule, TrailingStopRule):
@@ -596,9 +684,7 @@ def run_backtest(
             returns, float(initial_capital),
             level_dds, level_sizes, float(rule.reentry_recovery),
         )
-        _apply_transaction_costs(equity, sizes, cost)
-        return BacktestResult(strategy_name, rule.name, equity, sizes,
-                              initial_capital, transaction_cost_bps=transaction_cost_bps)
+        return _finalise(equity, sizes)
 
     # Fast path: VolScaledTrailingStop via numba.
     if _HAS_NUMBA and isinstance(rule, VolScaledTrailingStop):
@@ -616,10 +702,7 @@ def run_backtest(
             int(rule.vol_window_days), refresh_mode_code,
             int(rule.monthly_days), seed,
         )
-        _apply_transaction_costs(equity, sizes, cost)
-        return BacktestResult(strategy_name, rule.name, equity, sizes,
-                              initial_capital, vol_mult_log=vol_mult_log,
-                              transaction_cost_bps=transaction_cost_bps)
+        return _finalise(equity, sizes, vol_mult_log)
 
     # Fast path: RatioVolScaledTrailingStop via numba.
     if _HAS_NUMBA and isinstance(rule, RatioVolScaledTrailingStop):
@@ -635,17 +718,13 @@ def run_backtest(
             refresh_mode_code, int(rule.monthly_days),
             float(rule.vol_mult_floor), float(rule.vol_mult_cap),
         )
-        _apply_transaction_costs(equity, sizes, cost)
-        return BacktestResult(strategy_name, rule.name, equity, sizes,
-                              initial_capital, vol_mult_log=vol_mult_log,
-                              transaction_cost_bps=transaction_cost_bps)
+        return _finalise(equity, sizes, vol_mult_log)
 
     # Generic fallback: Python loop, works for any StopRule subclass.
     equity = np.empty((n_paths, path_length + 1))
     equity[:, 0] = initial_capital
     sizes = np.empty((n_paths, path_length))
 
-    # Optional vol_mult log for diagnostic plots when the rule tracks vol.
     is_vol_scaled = isinstance(rule, (VolScaledTrailingStop, RatioVolScaledTrailingStop))
     vol_mult_log = np.empty((n_paths, path_length)) if is_vol_scaled else None
 
@@ -663,18 +742,7 @@ def run_backtest(
             if is_vol_scaled:
                 vol_mult_log[p, t] = rule.current_vol_mult
 
-    # Apply transaction costs as post-processing (same as numba fast paths).
-    _apply_transaction_costs(equity, sizes, cost)
-
-    return BacktestResult(
-        strategy_name=strategy_name,
-        rule_name=rule.name,
-        equity_curves=equity,
-        position_sizes=sizes,
-        initial_capital=initial_capital,
-        vol_mult_log=vol_mult_log,
-        transaction_cost_bps=transaction_cost_bps,
-    )
+    return _finalise(equity, sizes, vol_mult_log)
 
 
 def compare(results: list[BacktestResult]) -> pd.DataFrame:
