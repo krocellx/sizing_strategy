@@ -244,6 +244,8 @@ if _HAS_NUMBA:
             long_head = 0
 
             vol_mult = 1.0
+            vol_mult_locked = 1.0  # used to hold vol_mult during the day while we observe returns
+            vol_locked = False  # whether vol_mult is currently locked (after observing return, before refresh)
             warmed_up = False
             days_since_refresh = 0
             in_path_days = 0
@@ -311,7 +313,8 @@ if _HAS_NUMBA:
                 # Monthly refresh (only meaningful after warmup).
                 if (refresh_mode_code == 0
                         and days_since_refresh >= monthly_days
-                        and warmed_up):
+                        and warmed_up
+                        and not vol_locked):
                     # Compute σ_short.
                     mean_s = 0.0
                     for i in range(short_filled):
@@ -358,6 +361,7 @@ if _HAS_NUMBA:
                     hwm = eq
                     cur_size = 1.0
                     cur_level = -1
+                    vol_locked = False
                     # HWM refresh.
                     if refresh_mode_code == 1 and warmed_up and short_filled >= 2:
                         mean_s = 0.0
@@ -391,14 +395,18 @@ if _HAS_NUMBA:
                             vol_mult = raw
                         days_since_refresh = 0
                     continue
-
+                
+                vm = vol_mult_locked if vol_locked else vol_mult
                 dd = hwm - eq
-                active_reentry = base_reentry_recovery * vol_mult
+                active_reentry = base_reentry_recovery * vm
 
                 # Single scan for both ratchet-down and re-entry.
                 warranted = -1
                 for i in range(n_levels):
-                    if dd >= base_level_dds[i] * vol_mult:
+                    trigger = base_level_dds[i]
+                    if i < n_levels - 1:
+                        trigger *= vm
+                    if dd >= trigger:
                         warranted = i
                     else:
                         break
@@ -406,9 +414,12 @@ if _HAS_NUMBA:
                 if warranted > cur_level:
                     cur_level = warranted
                     cur_size = base_level_sizes[warranted]
+                    if not vol_locked:
+                        vol_mult_locked = vol_mult
+                        vol_locked = True
                 elif active_reentry > 0.0 and cur_level >= 0 and cur_size > 0.0:
                     # Threshold-based re-entry.
-                    recovery_from_trigger = base_level_dds[cur_level] * vol_mult - dd
+                    recovery_from_trigger = base_level_dds[cur_level] * vm - dd
                     if recovery_from_trigger >= active_reentry and warranted < cur_level:
                         cur_level = warranted
                         cur_size = 1.0 if warranted == -1 else base_level_sizes[warranted]
