@@ -501,15 +501,14 @@ def _apply_quarterly_reset(
 
     Rule:
       - At the end of each quarter (every reset_every_days trading days),
-        check the current position size.
-      - If size == 1.0 (fully invested, no stop active):
-          * Record cash flow = equity - initial_capital
-            (positive = withdrawal, negative = top-up)
-          * Reset equity to initial_capital for ALL subsequent days
-            (the compounding base shifts, but future returns are unchanged)
-          * Reset HWM implicitly — the equity curve restarts from initial_capital
-            so all downstream DD calculations see a fresh reference.
-      - If size < 1.0 or size == 0.0: do nothing. Leave the path untouched.
+        check the current position size and equity.
+      - If size == 1.0 AND equity > initial_capital (profit quarter):
+          * Record cash flow = equity - initial_capital (withdrawal)
+          * Reset equity to initial_capital
+      - Otherwise: do nothing. Specifically:
+          * size < 1.0 or size == 0.0: stop is active, no reset
+          * size == 1.0 but equity <= initial_capital: underperforming,
+            no top-up. The loss is carried forward into the next quarter.
 
     Parameters
     ----------
@@ -534,16 +533,11 @@ def _apply_quarterly_reset(
 
     for p in range(n_paths):
         for q_idx, t in enumerate(reset_days):
-            # size_today is the size applied during day t.
-            # We check the size AFTER today's return (i.e. equity[t+1] is known).
             size_at_reset = sizes[p, t]
-            if size_at_reset == 1.0:
-                eq_before = equity[p, t + 1]
+            eq_before = equity[p, t + 1]
+            if size_at_reset == 1.0 and eq_before > initial_capital:
                 cf = eq_before - initial_capital
                 cash_flows[p, q_idx] = cf
-                # Shift all future equity values by the reset amount.
-                # equity[t+1] becomes initial_capital; subsequent values
-                # shift by the same delta (returns compound from new base).
                 delta = eq_before - initial_capital
                 equity[p, t + 1:] -= delta
 
