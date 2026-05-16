@@ -440,8 +440,28 @@ class BacktestResult:
     quarterly_reset: bool = False            # whether quarterly reset was applied
 
     @property
+    def total_cash_flows(self) -> np.ndarray:
+        """
+        Sum of all cash flows per path (NaN-safe).
+        Zero for paths with no resets. Always zero when quarterly_reset=False.
+        """
+        if self.cash_flows is None:
+            return np.zeros(len(self.equity_curves))
+        return np.nansum(self.cash_flows, axis=1)
+
+    @property
     def terminal_wealth(self) -> np.ndarray:
-        return self.equity_curves[:, -1]
+        """
+        Total wealth per path = terminal equity + cumulative cash flows.
+
+        When quarterly_reset=False, cash flows are zero so this equals
+        the terminal equity exactly (no change from prior behaviour).
+
+        When quarterly_reset=True, the equity curve is reset to initial_capital
+        each profitable quarter — so terminal equity alone understates returns.
+        Adding cumulative cash flows gives the investor's true total wealth.
+        """
+        return self.equity_curves[:, -1] + self.total_cash_flows
 
     @property
     def total_returns(self) -> np.ndarray:
@@ -449,7 +469,14 @@ class BacktestResult:
 
     @property
     def max_drawdowns(self) -> np.ndarray:
-        """Max drawdown per path, in dollars (from running HWM)."""
+        """
+        Max drawdown per path in dollars, from running HWM.
+
+        With quarterly_reset=True, the equity curve resets to initial_capital
+        each profitable quarter, so the HWM also resets. Max drawdown here
+        reflects the worst intra-quarter drawdown — consistent with the
+        quarterly mandate (don't lose more than $X from quarterly start).
+        """
         hwm = np.maximum.accumulate(self.equity_curves, axis=1)
         dd = hwm - self.equity_curves
         return dd.max(axis=1)
@@ -464,14 +491,14 @@ class BacktestResult:
         tr = self.total_returns
         dd = self.max_drawdowns
         dd_pct = self.max_drawdown_pct
-        # Annualized metrics assume path_length is in business days.
         n_days = self.equity_curves.shape[1] - 1
         years = n_days / 252
+        # CAGR uses total investor wealth (equity + cash).
         cagr = (self.terminal_wealth / self.initial_capital) ** (1 / years) - 1
-        # Sharpe from per-path daily equity returns.
+        # Sharpe from daily equity-curve returns (captures within-quarter dynamics).
         daily_eq_returns = np.diff(self.equity_curves, axis=1) / self.equity_curves[:, :-1]
         sharpe = daily_eq_returns.mean(axis=1) / daily_eq_returns.std(axis=1) * np.sqrt(252)
-        return pd.Series({
+        s = pd.Series({
             'strategy': self.strategy_name,
             'rule': self.rule_name,
             'mean_total_return': tr.mean(),
@@ -488,6 +515,16 @@ class BacktestResult:
             'prob_loss': (tr < 0).mean(),
             'prob_50pct_dd': (dd_pct > 0.5).mean(),
         })
+        # Add cash flow summary when quarterly reset is active.
+        if self.quarterly_reset and self.cash_flows is not None:
+            s['mean_total_cash_out'] = self.total_cash_flows.mean()
+            s['pct_quarters_positive'] = float(
+                np.nanmean(self.cash_flows > 0)
+            )
+            s['mean_quarters_with_reset'] = float(
+                np.isfinite(self.cash_flows).sum(axis=1).mean()
+            )
+        return s
 
 
 def _apply_quarterly_reset(
