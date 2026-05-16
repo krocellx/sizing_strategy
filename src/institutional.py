@@ -130,24 +130,37 @@ def plot_equity_fan(
     """
     Equity fan chart: median path + shaded bands across paths, one color per rule.
 
-    The single most effective visualization in an institutional setting.
-    Shows expected trajectory AND how the distribution evolves over time.
+    Uses cumulative_wealth_curves — when quarterly_reset=True, this adds back
+    extracted cash so the fan shows the investor's true total wealth trajectory
+    rather than the in-fund equity which resets to initial_capital each quarter.
+    When quarterly_reset=False, cumulative_wealth_curves == equity_curves.
     """
     if ax is None:
         _, ax = plt.subplots(figsize=(11, 6))
     colors = plt.cm.tab10.colors
     for i, r in enumerate(results):
-        eq = r.equity_curves / r.initial_capital  # normalize to 1.0 start
+        eq = r.cumulative_wealth_curves / r.initial_capital
         t = np.arange(eq.shape[1]) / periods_per_year
         c = colors[i % len(colors)]
-        q_low = np.quantile(eq, percentiles[0], axis=0)
-        q_lo = np.quantile(eq, percentiles[1], axis=0)
-        q_md = np.quantile(eq, percentiles[2], axis=0)
-        q_hi = np.quantile(eq, percentiles[3], axis=0)
+        q_low  = np.quantile(eq, percentiles[0], axis=0)
+        q_lo   = np.quantile(eq, percentiles[1], axis=0)
+        q_md   = np.quantile(eq, percentiles[2], axis=0)
+        q_hi   = np.quantile(eq, percentiles[3], axis=0)
         q_high = np.quantile(eq, percentiles[4], axis=0)
         ax.fill_between(t, q_low, q_high, color=c, alpha=0.12)
-        ax.fill_between(t, q_lo, q_hi, color=c, alpha=0.25)
-        ax.plot(t, q_md, color=c, lw=2, label=f'{r.strategy_name} / {r.rule_name}')
+        ax.fill_between(t, q_lo,  q_hi,   color=c, alpha=0.25)
+        ax.plot(t, q_md, color=c, lw=2,
+                label=f'{r.strategy_name} / {r.rule_name}')
+
+    ax.axhline(1.0, color='k', ls=':', alpha=0.4)
+    ax.set_xlabel('Years')
+    ax.set_ylabel('Cumulative wealth (normalised to 1.0)')
+    ax.set_title(title or 'Equity fan chart (median, 25/75, 5/95)')
+    if log_y:
+        ax.set_yscale('log')
+    ax.legend(fontsize=9, loc='upper left')
+    ax.grid(alpha=0.3)
+    return ax
 
     ax.axhline(1.0, color='k', ls=':', alpha=0.4)
     ax.set_xlabel('Years')
@@ -786,19 +799,26 @@ def institutional_summary(
 ) -> pd.DataFrame:
     """
     One-row-per-result table with the metrics allocators actually ask for.
-    Pairs well with the four plots above for a pitch-deck one-pager.
+
+    Uses BacktestResult properties throughout so quarterly_reset is handled
+    correctly — total_returns and CAGR include cumulative cash flows when
+    quarterly_reset=True.
     """
     rows = []
     for r in results:
-        tr = r.total_returns
+        tr     = r.total_returns       # (equity + cash) / initial - 1
+        tw     = r.terminal_wealth     # equity + cumulative cash (correct)
         dd_pct = r.max_drawdown_pct
-        eq = r.equity_curves
-        years = (eq.shape[1] - 1) / 252
-        cagr = (eq[:, -1] / eq[:, 0]) ** (1 / years) - 1
+        n_days = r.equity_curves.shape[1] - 1
+        years  = n_days / 252
 
-        # Rolling 1yr worst across all (path, start-day).
+        # CAGR from corrected terminal_wealth.
+        cagr = (tw / r.initial_capital) ** (1 / years) - 1
+
+        # Rolling 1yr from equity_curves (within-quarter experience).
+        eq = r.equity_curves
         if eq.shape[1] > 252:
-            roll_1y = eq[:, 252:] / eq[:, :-252] - 1
+            roll_1y  = eq[:, 252:] / eq[:, :-252] - 1
             worst_1y = np.quantile(roll_1y.ravel(), 0.05)
         else:
             worst_1y = np.nan
@@ -806,19 +826,27 @@ def institutional_summary(
         calmar = np.where(dd_pct > 0, cagr / dd_pct, np.nan)
 
         row = {
-            'strategy': r.strategy_name,
-            'rule': r.rule_name,
-            'mean_CAGR': cagr.mean(),
-            'median_CAGR': np.median(cagr),
-            'mean_Calmar': np.nanmean(calmar),
-            'mean_maxDD_%': dd_pct.mean(),
-            'p95_maxDD_%': np.quantile(dd_pct, 0.95),
-            'rolling_1yr_p05': worst_1y,
-            'CVaR05_return': tr[tr <= np.quantile(tr, 0.05)].mean(),
+            'strategy':          r.strategy_name,
+            'rule':              r.rule_name,
+            'mean_CAGR':         cagr.mean(),
+            'median_CAGR':       np.median(cagr),
+            'mean_Calmar':       np.nanmean(calmar),
+            'mean_maxDD_%':      dd_pct.mean(),
+            'p95_maxDD_%':       np.quantile(dd_pct, 0.95),
+            'rolling_1yr_p05':   worst_1y,
+            'CVaR05_return':     tr[tr <= np.quantile(tr, 0.05)].mean(),
             'prob_negative_5yr': float((tr < 0).mean()),
         }
         for t in dd_thresholds:
             row[f'P(maxDD>{int(t*100)}%)'] = float((dd_pct > t).mean())
+
+        # Cash flow stats when quarterly reset is active.
+        if r.quarterly_reset and r.cash_flows is not None:
+            row['mean_cash_out_total']  = r.total_cash_flows.mean()
+            row['pct_qtrs_positive']    = float(np.nanmean(r.cash_flows > 0))
+            row['mean_qtrs_with_reset'] = float(
+                np.isfinite(r.cash_flows).sum(axis=1).mean()
+            )
         rows.append(row)
     return pd.DataFrame(rows)
 

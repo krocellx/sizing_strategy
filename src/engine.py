@@ -450,6 +450,37 @@ class BacktestResult:
         return np.nansum(self.cash_flows, axis=1)
 
     @property
+    def cumulative_wealth_curves(self) -> np.ndarray:
+        """
+        Equity curve + cumulative cash flows extracted so far, shape (n_paths, n_days+1).
+
+        When quarterly_reset=False, identical to equity_curves.
+        When quarterly_reset=True, adds back the cash withdrawn each quarter
+        so the curve represents the investor's true total wealth trajectory
+        (what's in the fund + what's been taken out). This gives monotonically
+        increasing curves for profitable strategies, suitable for fan plots.
+        """
+        if self.cash_flows is None or not self.quarterly_reset:
+            return self.equity_curves
+
+        n_paths, n_days_plus1 = self.equity_curves.shape
+        n_days = n_days_plus1 - 1
+        n_quarters = self.cash_flows.shape[1]
+        reset_every = n_days // n_quarters  # approximate, same as used in reset
+
+        # Build cumulative cash up to each day.
+        cumcash = np.zeros((n_paths, n_days_plus1))
+        for q_idx in range(n_quarters):
+            t = (q_idx + 1) * reset_every     # day of reset
+            if t >= n_days_plus1:
+                break
+            cf = np.where(np.isfinite(self.cash_flows[:, q_idx]),
+                          self.cash_flows[:, q_idx], 0.0)
+            cumcash[:, t:] += cf[:, np.newaxis]
+
+        return self.equity_curves + cumcash
+
+    @property
     def terminal_wealth(self) -> np.ndarray:
         """
         Total wealth per path = terminal equity + cumulative cash flows.
