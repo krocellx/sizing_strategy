@@ -316,8 +316,12 @@ def combine_sleeves(
                          f"share the same scenarios.")
 
     total_equity = None
+    total_cash_flows = None
+    any_cash_flow = None
     total_sizes_weighted = None
     total_initial = 0.0
+    quarterly_reset = False
+    reset_every_days = None
     for s in strategies:
         r = results[(s, rule_label)]
         cap = capitals[s]
@@ -332,7 +336,38 @@ def combine_sleeves(
             total_sizes_weighted += r.position_sizes * weight
         total_initial += cap
 
+        if r.quarterly_reset:
+            quarterly_reset = True
+            if r.cash_flows is None:
+                raise ValueError(
+                    f"{s}/{rule_label} has quarterly_reset=True but no cash_flows"
+                )
+            if reset_every_days is None:
+                reset_every_days = r.reset_every_days
+            elif reset_every_days != r.reset_every_days:
+                raise ValueError(
+                    "Cannot combine sleeves with different reset_every_days "
+                    f"({reset_every_days} vs {r.reset_every_days})."
+                )
+
+            scaled_cf = r.cash_flows * scale
+            finite_cf = np.isfinite(scaled_cf)
+            cf_values = np.where(finite_cf, scaled_cf, 0.0)
+            if total_cash_flows is None:
+                total_cash_flows = cf_values.copy()
+                any_cash_flow = finite_cf.copy()
+            else:
+                if total_cash_flows.shape != cf_values.shape:
+                    raise ValueError(
+                        "Sleeves have mismatched cash_flow shapes "
+                        f"{total_cash_flows.shape} vs {cf_values.shape}."
+                    )
+                total_cash_flows += cf_values
+                any_cash_flow |= finite_cf
+
     avg_sizes = total_sizes_weighted / total_initial
+    if total_cash_flows is not None:
+        total_cash_flows = np.where(any_cash_flow, total_cash_flows, np.nan)
 
     return BacktestResult(
         strategy_name=combined_name,
@@ -340,6 +375,9 @@ def combine_sleeves(
         equity_curves=total_equity,
         position_sizes=avg_sizes,
         initial_capital=total_initial,
+        cash_flows=total_cash_flows,
+        quarterly_reset=quarterly_reset,
+        reset_every_days=reset_every_days or 63,
     )
 
 
