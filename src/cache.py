@@ -108,8 +108,25 @@ class CachedResult:
         return self._sharpe
 
     @property
+    def cumulative_cash_flow_curves(self) -> np.ndarray:
+        return np.zeros_like(self.equity_curves)
+
+    @property
     def cumulative_wealth_curves(self) -> np.ndarray:
         return self.equity_curves
+
+    @property
+    def drawdown_curves(self) -> np.ndarray:
+        eq = self.equity_curves
+        hwm = np.maximum.accumulate(eq, axis=1)
+        return hwm - eq
+
+    @property
+    def drawdown_pct_curves(self) -> np.ndarray:
+        eq = self.equity_curves
+        hwm = np.maximum.accumulate(eq, axis=1)
+        with np.errstate(invalid='ignore', divide='ignore'):
+            return np.where(hwm > 0, (hwm - eq) / hwm, 0.0)
 
     def rolling_returns(
         self,

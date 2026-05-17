@@ -41,24 +41,14 @@ class BacktestResult:
         return np.nansum(self.cash_flows, axis=1)
 
     @property
-    def cumulative_wealth_curves(self) -> np.ndarray:
-        """
-        Equity curve + cumulative cash flows extracted so far, shape (n_paths, n_days+1).
-
-        When quarterly_reset=False, identical to equity_curves.
-        When quarterly_reset=True, adds back the cash withdrawn each quarter
-        so the curve represents the investor's true total wealth trajectory
-        (what's in the fund + what's been taken out). This gives monotonically
-        increasing curves for profitable strategies, suitable for fan plots.
-        """
-        if self.cash_flows is None or not self.quarterly_reset:
-            return self.equity_curves
-
-        n_quarters = self.cash_flows.shape[1]
-
-        # Build cumulative cash up to each day.
+    def cumulative_cash_flow_curves(self) -> np.ndarray:
+        """Cumulative extracted cash through each day, shape (n_paths, n_days+1)."""
         n_paths, n_days_plus1 = self.equity_curves.shape
         cumcash = np.zeros((n_paths, n_days_plus1))
+        if self.cash_flows is None or not self.quarterly_reset:
+            return cumcash
+
+        n_quarters = self.cash_flows.shape[1]
         for q_idx in range(n_quarters):
             t = (q_idx + 1) * self.reset_every_days
             if t >= n_days_plus1:
@@ -67,7 +57,51 @@ class BacktestResult:
                           self.cash_flows[:, q_idx], 0.0)
             cumcash[:, t:] += cf[:, np.newaxis]
 
+        return cumcash
+
+    @property
+    def cumulative_wealth_curves(self) -> np.ndarray:
+        """
+        Equity curve + cumulative cash flows extracted so far, shape (n_paths, n_days+1).
+
+        When quarterly_reset=False, identical to equity_curves.
+        When quarterly_reset=True, adds back the cash withdrawn each quarter
+        so the curve represents the investor's true total wealth trajectory
+        (what's in the fund + what's been taken out).
+        """
+        if self.cash_flows is None or not self.quarterly_reset:
+            return self.equity_curves
+        cumcash = self.cumulative_cash_flow_curves
         return self.equity_curves + cumcash
+
+    @property
+    def drawdown_curves(self) -> np.ndarray:
+        """
+        Reset-aware drawdown dollars for each path and day.
+
+        With quarterly_reset=True, cash withdrawals are not treated as
+        drawdowns. This is equivalent to computing drawdown on investor
+        wealth (equity + extracted cash).
+        """
+        wealth = self.cumulative_wealth_curves
+        hwm = np.maximum.accumulate(wealth, axis=1)
+        return hwm - wealth
+
+    @property
+    def drawdown_pct_curves(self) -> np.ndarray:
+        """
+        Reset-aware drawdown percentage for each path and day.
+
+        Dollar drawdown is measured on total investor wealth, while the
+        denominator is the in-fund HWM after subtracting extracted cash. That
+        keeps quarterly cash withdrawals from creating artificial drawdowns.
+        """
+        wealth = self.cumulative_wealth_curves
+        wealth_hwm = np.maximum.accumulate(wealth, axis=1)
+        in_fund_hwm = wealth_hwm - self.cumulative_cash_flow_curves
+        dd = wealth_hwm - wealth
+        with np.errstate(invalid='ignore', divide='ignore'):
+            return np.where(in_fund_hwm > 0, dd / in_fund_hwm, 0.0)
 
     @property
     def terminal_wealth(self) -> np.ndarray:
@@ -101,15 +135,11 @@ class BacktestResult:
         reflects the worst intra-quarter drawdown — consistent with the
         quarterly mandate (don't lose more than $X from quarterly start).
         """
-        hwm = np.maximum.accumulate(self.equity_curves, axis=1)
-        dd = hwm - self.equity_curves
-        return dd.max(axis=1)
+        return self.drawdown_curves.max(axis=1)
 
     @property
     def max_drawdown_pct(self) -> np.ndarray:
-        hwm = np.maximum.accumulate(self.equity_curves, axis=1)
-        dd_pct = (hwm - self.equity_curves) / hwm
-        return dd_pct.max(axis=1)
+        return self.drawdown_pct_curves.max(axis=1)
 
     @property
     def calmar(self) -> np.ndarray:
@@ -339,14 +369,17 @@ def run_backtest(
     returns = np.ascontiguousarray(strategy_returns_paths, dtype=np.float64)
     cost = transaction_cost_bps / 10_000.0  # convert bps to fraction
 
-    def _finalise(equity, sizes, vol_mult_log=None):
+    reset_days = list(range(reset_every_days - 1, path_length, reset_every_days))
+    reset_day_to_quarter = {t: i for i, t in enumerate(reset_days)}
+
+    def _empty_cash_flows() -> np.ndarray | None:
+        if not quarterly_reset:
+            return None
+        return np.full((n_paths, len(reset_days)), np.nan)
+
+    def _finalise(equity, sizes, vol_mult_log=None, cash_flows=None):
         """Apply post-processing and return BacktestResult."""
         _apply_transaction_costs(equity, sizes, cost)
-        cfs = None
-        if quarterly_reset:
-            cfs = _apply_quarterly_reset(
-                equity, sizes, initial_capital, reset_every_days
-            )
         return BacktestResult(
             strategy_name=strategy_name,
             rule_name=rule.name,
@@ -355,13 +388,13 @@ def run_backtest(
             initial_capital=initial_capital,
             vol_mult_log=vol_mult_log,
             transaction_cost_bps=transaction_cost_bps,
-            cash_flows=cfs,
+            cash_flows=cash_flows,
             quarterly_reset=quarterly_reset,
             reset_every_days=reset_every_days,
         )
 
     # Fast path: NoStop is trivial.
-    if isinstance(rule, NoStop):
+    if isinstance(rule, NoStop) and not quarterly_reset:
         equity = np.empty((n_paths, path_length + 1))
         equity[:, 0] = initial_capital
         equity[:, 1:] = initial_capital * np.cumprod(1.0 + returns, axis=1)
@@ -370,7 +403,7 @@ def run_backtest(
 
     # Optimized rules own their compiled path implementation.
     fast_path = getattr(rule, "run_fast_path", None)
-    if fast_path is not None:
+    if fast_path is not None and not quarterly_reset:
         try:
             equity, sizes, vol_mult_log = fast_path(returns, float(initial_capital))
             return _finalise(equity, sizes, vol_mult_log)
@@ -381,6 +414,7 @@ def run_backtest(
     equity = np.empty((n_paths, path_length + 1))
     equity[:, 0] = initial_capital
     sizes = np.empty((n_paths, path_length))
+    cash_flows = _empty_cash_flows()
 
     is_vol_scaled = isinstance(rule, (VolScaledTrailingStop, RatioVolScaledTrailingStop))
     vol_mult_log = np.empty((n_paths, path_length)) if is_vol_scaled else None
@@ -395,11 +429,18 @@ def run_backtest(
             sizes[p, t] = size
             eq = eq * (1 + size * r)
             equity[p, t + 1] = eq
-            size = rule.update(eq)
+            if quarterly_reset and t in reset_day_to_quarter and size == 1.0 and eq > initial_capital:
+                cash_flows[p, reset_day_to_quarter[t]] = eq - initial_capital
+                eq = initial_capital
+                equity[p, t + 1] = eq
+                rule.reset_notional(initial_capital)
+                size = 1.0
+            else:
+                size = rule.update(eq)
             if is_vol_scaled:
                 vol_mult_log[p, t] = rule.current_vol_mult
 
-    return _finalise(equity, sizes, vol_mult_log)
+    return _finalise(equity, sizes, vol_mult_log, cash_flows)
 
 
 def compare(results: list[BacktestResult]) -> pd.DataFrame:

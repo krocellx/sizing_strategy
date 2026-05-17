@@ -184,10 +184,8 @@ def plot_drawdown_fan(
         _, ax = plt.subplots(figsize=(11, 5))
     colors = plt.cm.tab10.colors
     for i, r in enumerate(results):
-        eq = r.equity_curves
-        hwm = np.maximum.accumulate(eq, axis=1)
-        dd_pct = (hwm - eq) / hwm  # positive = drawdown magnitude
-        t = np.arange(eq.shape[1]) / periods_per_year
+        dd_pct = r.drawdown_pct_curves
+        t = np.arange(dd_pct.shape[1]) / periods_per_year
         c = colors[i % len(colors)]
         for j, q in enumerate(percentiles):
             curve = np.quantile(dd_pct, q, axis=0)
@@ -230,10 +228,9 @@ def plot_pct_at_hwm(
         _, ax = plt.subplots(figsize=(11, 5))
     colors = plt.cm.tab10.colors
     for i, r in enumerate(results):
-        eq = r.equity_curves
-        hwm = np.maximum.accumulate(eq, axis=1)
-        at_hwm = (eq >= hwm).mean(axis=0)   # fraction at HWM each day
-        t = np.arange(eq.shape[1]) / periods_per_year
+        dd_pct = r.drawdown_pct_curves
+        at_hwm = (dd_pct <= 1e-12).mean(axis=0)
+        t = np.arange(dd_pct.shape[1]) / periods_per_year
         c = colors[i % len(colors)]
         ax.plot(t, at_hwm, color=c, lw=1.5,
                 label=f'{r.strategy_name}/{r.rule_name}')

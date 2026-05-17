@@ -121,9 +121,7 @@ def time_under_water(result: BacktestResult) -> np.ndarray:
     Per-path fraction of days where equity is below its running HWM.
     Returns an array of length n_paths.
     """
-    eq = result.equity_curves
-    hwm = np.maximum.accumulate(eq, axis=1)
-    underwater = eq < hwm
+    underwater = result.drawdown_curves > 0
     return underwater.mean(axis=1)
 
 
@@ -135,10 +133,9 @@ def recovery_times(result: BacktestResult,
 
     Returns an array of recovery times for paths that breached.
     """
-    eq = result.equity_curves
-    n_paths, n_days = eq.shape
-    hwm = np.maximum.accumulate(eq, axis=1)
-    dd = hwm - eq
+    wealth = result.cumulative_wealth_curves
+    n_paths, n_days = wealth.shape
+    dd = result.drawdown_curves
 
     recoveries = []
     for p in range(n_paths):
@@ -146,8 +143,7 @@ def recovery_times(result: BacktestResult,
         if len(breaches) == 0:
             continue
         first_breach = breaches[0]
-        hwm_at_breach = hwm[p, first_breach]
-        recovered = np.where(eq[p, first_breach:] > hwm_at_breach)[0]
+        recovered = np.where(dd[p, first_breach:] <= 0)[0]
         recoveries.append(recovered[0] if len(recovered) else np.inf)
     return np.array(recoveries, dtype=float)
 

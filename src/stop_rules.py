@@ -47,6 +47,15 @@ class StopRule(ABC):
         """
         pass
 
+    def reset_notional(self, initial_capital: float) -> None:
+        """
+        Reset notional/HWM stop state without necessarily clearing diagnostics.
+
+        Used for mandate-level quarterly resets. Rules with return buffers
+        should override this to preserve their vol/history state.
+        """
+        self.reset(initial_capital)
+
     @property
     @abstractmethod
     def name(self) -> str:
@@ -61,6 +70,9 @@ class NoStop(StopRule):
 
     def update(self, equity: float) -> float:
         return 1.0
+
+    def reset_notional(self, initial_capital: float) -> None:
+        pass
 
     @property
     def name(self) -> str:
@@ -105,6 +117,11 @@ class TrailingStopRule(StopRule):
                 )
 
     def reset(self, initial_capital: float) -> None:
+        self._hwm = initial_capital
+        self._current_size = 1.0
+        self._current_level_idx = -1
+
+    def reset_notional(self, initial_capital: float) -> None:
         self._hwm = initial_capital
         self._current_size = 1.0
         self._current_level_idx = -1
@@ -269,6 +286,11 @@ class VolScaledTrailingStop(StopRule):
         self._days_since_refresh = 0
         # Compute initial vol_mult from seed (or fall back to 1.0).
         self._refresh_vol_mult()
+
+    def reset_notional(self, initial_capital: float) -> None:
+        self._hwm = initial_capital
+        self._current_size = 1.0
+        self._current_level_idx = -1
 
     def _current_realised_vol(self) -> float:
         """Annualised realised vol from buffer, or reference_vol if too few obs."""
@@ -488,6 +510,11 @@ class RatioVolScaledTrailingStop(StopRule):
         self._days_since_refresh = 0
         self._in_path_days = 0
         self._warmed_up = False
+
+    def reset_notional(self, initial_capital: float) -> None:
+        self._hwm = initial_capital
+        self._current_size = 1.0
+        self._current_level_idx = -1
 
     @staticmethod
     def _annualised_vol(buf: list) -> float:
