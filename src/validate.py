@@ -7,6 +7,16 @@ mechanics of the trailing stop rule, the equity curve, the drawdown, and
 the summary statistics are all correct.
 """
 
+import os
+import sys
+from pathlib import Path
+
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 import numpy as np
 import pandas as pd
 from src import (
@@ -70,7 +80,6 @@ hand_eq = [INITIAL]
 hand_sz = []
 eq = INITIAL
 hwm = INITIAL
-trough = INITIAL
 cur_size = 1.0
 cur_level = -1
 
@@ -82,35 +91,26 @@ for t in range(len(r)):
     # Update state.
     if eq > hwm:
         hwm = eq
-        trough = eq
         cur_size = 1.0
         cur_level = -1
         continue
-    if eq < trough:
-        trough = eq
+
     dd = hwm - eq
-    triggered = -1
+    warranted = -1
     for i, ldd in enumerate(level_dds):
         if dd >= ldd:
-            triggered = i
+            warranted = i
         else:
             break
-    if triggered > cur_level:
-        cur_level = triggered
-        cur_size = level_sizes[triggered]
-        trough = eq
+    if warranted > cur_level:
+        cur_level = warranted
+        cur_size = level_sizes[warranted]
     elif REENTRY > 0 and cur_level >= 0:
-        if eq - trough >= REENTRY:
-            new_level = -1
-            for i, ldd in enumerate(level_dds):
-                if dd >= ldd:
-                    new_level = i
-                else:
-                    break
-            if new_level < cur_level:
-                cur_level = new_level
-                cur_size = 1.0 if new_level == -1 else level_sizes[new_level]
-                trough = eq
+        current_trigger = level_dds[cur_level]
+        recovery_from_trigger = current_trigger - dd
+        if recovery_from_trigger >= REENTRY and warranted < cur_level:
+            cur_level = warranted
+            cur_size = 1.0 if warranted == -1 else level_sizes[warranted]
 
 hand_eq = np.array(hand_eq)
 hand_sz = np.array(hand_sz)
