@@ -618,15 +618,33 @@ def plot_conditional_diverging(
 
 def plot_size_change_frequency(
     results: Sequence[BacktestResult],
-    window_days: int = 21,
+    window_days: int = 63,
     periods_per_year: int = 252,
     ax=None,
     title: str | None = None,
+    event_type: str = "cuts",
+    mode: str = "probability",
+    smooth_days: int | None = None,
 ):
     """
-    Rolling event density over simulated path time: average number of
-    size-change events per month at each point in the simulated period,
-    averaged across all paths.
+    Rolling size-change diagnostics over simulated path time.
+
+    By default this plots the share of paths with at least one CUT in the
+    trailing window. That is usually easier to interpret than the old mixed
+    event count, which treated cuts, raises, and re-entries as equivalent.
+
+    Parameters
+    ----------
+    event_type : {'cuts', 'raises', 'stopouts', 'all'}
+        Which event to count. 'cuts' means size decreased, 'raises' means size
+        increased, 'stopouts' means size moved to zero, and 'all' preserves the
+        old behavior of counting any size change.
+    mode : {'probability', 'count'}
+        - 'probability': share of paths with at least one event in the window.
+        - 'count': mean number of events per path in the window.
+    smooth_days : int or None
+        Optional smoothing window applied after the event window. Useful when
+        quarterly reset creates visible short-horizon seasonality.
 
     Signs to look for:
       - Spike at the start then near-zero: rule fires quickly, paths go flat.
@@ -639,6 +657,11 @@ def plot_size_change_frequency(
     High frequency overall = rule may be whipsawing on noise.
     High frequency only in early months = stopout-dominated.
     """
+    if event_type not in {"cuts", "raises", "stopouts", "all"}:
+        raise ValueError("event_type must be one of: cuts, raises, stopouts, all")
+    if mode not in {"probability", "count"}:
+        raise ValueError("mode must be 'probability' or 'count'")
+
     if ax is None:
         _, ax = plt.subplots(figsize=(12, 5))
     colors = plt.cm.tab10.colors
@@ -649,19 +672,39 @@ def plot_size_change_frequency(
         sizes = r.position_sizes          # (n_paths, n_days)
         n_paths, n_days = sizes.shape
         prev = np.concatenate([np.ones((n_paths, 1)), sizes[:, :-1]], axis=1)
-        events = (sizes != prev).astype(float)  # 1 where size changed
+        if event_type == "cuts":
+            events = sizes < prev
+        elif event_type == "raises":
+            events = sizes > prev
+        elif event_type == "stopouts":
+            events = (sizes == 0.0) & (prev > 0.0)
+        else:
+            events = sizes != prev
 
-        # Rolling window sum averaged across paths.
-        density = pd.DataFrame(events.T).rolling(window_days).sum().mean(axis=1)
+        rolling = pd.DataFrame(events.astype(float).T).rolling(
+            window_days,
+            min_periods=1,
+        ).sum()
+        if mode == "probability":
+            density = (rolling > 0).mean(axis=1)
+        else:
+            density = rolling.mean(axis=1)
+        if smooth_days is not None and smooth_days > 1:
+            density = density.rolling(smooth_days, min_periods=1).mean()
         t = np.arange(len(density)) / periods_per_year
         c = colors[i % len(colors)]
         ax.plot(t, density, color=c, lw=1.5,
                 label=f'{r.strategy_name}/{r.rule_name}')
 
     ax.set_xlabel('Years into simulated path')
-    ax.set_ylabel(f'Mean events per {window_days}-day window (avg across paths)')
-    ax.set_title(title or f'Size-Change Event Density Over Simulated Time\n'
-                           f'(rolling {window_days}-day window)')
+    if mode == "probability":
+        ax.set_ylabel(f'Paths with >=1 {event_type[:-1] if event_type.endswith("s") else event_type} in trailing {window_days}d')
+        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f'{y:.0%}'))
+    else:
+        ax.set_ylabel(f'Mean {event_type} per trailing {window_days}d per path')
+    smooth_note = f', smoothed {smooth_days}d' if smooth_days and smooth_days > 1 else ''
+    ax.set_title(title or f'Size-Change {event_type.title()} Over Simulated Time\n'
+                           f'({mode}, trailing {window_days}d{smooth_note})')
     ax.legend(fontsize=9)
     ax.grid(alpha=0.3)
     return ax
