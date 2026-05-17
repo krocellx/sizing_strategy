@@ -60,6 +60,7 @@ src/
 run.py                End-to-end runner.
 analysis.ipynb        Exploratory notebook.
 requirements.txt      Python dependencies.
+tests/                Unit tests for engine/rule/accounting semantics.
 ```
 
 ## Important Design Points
@@ -273,6 +274,16 @@ The validation checks:
 3. Terminal wealth, total return, max drawdown dollars, and max drawdown
    percent match `BacktestResult` properties.
 4. `NoStop` matches the independent `initial * cumprod(1 + returns)` formula.
+
+Run the unit tests:
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+The tests cover quarterly reset semantics, cash-flow-aware sleeve combination,
+reset-aware drawdowns, fast-path equivalence for the fixed trailing stop, and
+explicit ratio-vol window configuration.
 
 ## Outputs
 
