@@ -39,7 +39,8 @@ class CachedResult:
     but keeps equity_curves and position_sizes on disk.
 
     Exposes the same public surface as BacktestResult:
-      - terminal_wealth, total_returns, max_drawdowns, max_drawdown_pct
+      - terminal_wealth, total_returns, cagr, calmar
+      - max_drawdowns, max_drawdown_pct, rolling_returns
       - equity_curves, position_sizes  (lazy — loaded from disk on access)
       - summary()
       - strategy_name, rule_name, initial_capital
@@ -70,6 +71,14 @@ class CachedResult:
     # ---- Eagerly-available summary statistics ------------------------------
 
     @property
+    def n_days(self) -> int:
+        return self._n_days
+
+    @property
+    def years(self) -> float:
+        return self._n_days / 252
+
+    @property
     def terminal_wealth(self) -> np.ndarray:
         return self._terminal_wealth
 
@@ -78,12 +87,39 @@ class CachedResult:
         return self._terminal_wealth / self.initial_capital - 1.0
 
     @property
+    def cagr(self) -> np.ndarray:
+        return (self._terminal_wealth / self.initial_capital) ** (1 / self.years) - 1
+
+    @property
     def max_drawdowns(self) -> np.ndarray:
         return self._max_drawdowns
 
     @property
     def max_drawdown_pct(self) -> np.ndarray:
         return self._max_drawdown_pct
+
+    @property
+    def calmar(self) -> np.ndarray:
+        dd_pct = self._max_drawdown_pct
+        return np.where(dd_pct > 0, self.cagr / dd_pct, np.nan)
+
+    @property
+    def sharpe(self) -> np.ndarray:
+        return self._sharpe
+
+    @property
+    def cumulative_wealth_curves(self) -> np.ndarray:
+        return self.equity_curves
+
+    def rolling_returns(
+        self,
+        window_days: int = 252,
+        use_cumulative_wealth: bool = True,
+    ) -> np.ndarray:
+        curve = self.cumulative_wealth_curves if use_cumulative_wealth else self.equity_curves
+        if curve.shape[1] <= window_days:
+            return np.empty((curve.shape[0], 0))
+        return curve[:, window_days:] / curve[:, :-window_days] - 1.0
 
     # ---- Lazy full-curve access --------------------------------------------
 
@@ -139,8 +175,6 @@ class CachedResult:
         tr = self.total_returns
         dd = self._max_drawdowns
         dd_pct = self._max_drawdown_pct
-        years = self._n_days / 252
-        cagr = (self._terminal_wealth / self.initial_capital) ** (1 / years) - 1
         return pd.Series({
             'strategy': self.strategy_name,
             'rule': self.rule_name,
@@ -148,13 +182,13 @@ class CachedResult:
             'median_total_return': np.median(tr),
             'p05_total_return': np.percentile(tr, 5),
             'p95_total_return': np.percentile(tr, 95),
-            'mean_cagr': cagr.mean(),
+            'mean_cagr': self.cagr.mean(),
             'mean_max_dd_$': dd.mean(),
             'p95_max_dd_$': np.percentile(dd, 95),
             'p99_max_dd_$': np.percentile(dd, 99),
             'mean_max_dd_pct': dd_pct.mean(),
             'p95_max_dd_pct': np.percentile(dd_pct, 95),
-            'mean_sharpe': np.nanmean(self._sharpe),
+            'mean_sharpe': np.nanmean(self.sharpe),
             'prob_loss': (tr < 0).mean(),
             'prob_50pct_dd': (dd_pct > 0.5).mean(),
         })

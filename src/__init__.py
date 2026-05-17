@@ -46,10 +46,12 @@ from .institutional import (
     plot_stopout_pct,
 )
 
+from .example_data import generate_random_strategy_returns
+
 __all__ = [
     # simulation
     "politis_white_L", "stationary_bootstrap_indices", "apply_indices",
-    "generate_scenarios",
+    "generate_scenarios", "example_data",
     # rules & engine
     "StopRule", "NoStop", "TrailingStopRule", "VolScaledTrailingStop",
     "RatioVolScaledTrailingStop",

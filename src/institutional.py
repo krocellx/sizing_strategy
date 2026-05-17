@@ -35,14 +35,9 @@ def rolling_return_stats(
     have experienced if they'd invested at the worst possible moment.
     Reports p01/p05/p25/median and the single worst across all paths.
     """
-    eq = result.equity_curves
-    n_paths, n_days_plus_1 = eq.shape
-    n_days = n_days_plus_1 - 1
-    if n_days < window_days:
-        return pd.Series({'error': f'path_length {n_days} < window {window_days}'})
-
-    # Rolling returns: eq[t + window] / eq[t] - 1, over all valid (path, t).
-    rolling = eq[:, window_days:] / eq[:, :-window_days] - 1.0
+    rolling = result.rolling_returns(window_days, use_cumulative_wealth=True)
+    if rolling.shape[1] == 0:
+        return pd.Series({'error': f'path_length {result.n_days} < window {window_days}'})
     flat = rolling.ravel()
 
     label = 'y' if window_days == periods_per_year else f'{window_days}d'
@@ -155,16 +150,6 @@ def plot_equity_fan(
     ax.axhline(1.0, color='k', ls=':', alpha=0.4)
     ax.set_xlabel('Years')
     ax.set_ylabel('Cumulative wealth (normalised to 1.0)')
-    ax.set_title(title or 'Equity fan chart (median, 25/75, 5/95)')
-    if log_y:
-        ax.set_yscale('log')
-    ax.legend(fontsize=9, loc='upper left')
-    ax.grid(alpha=0.3)
-    return ax
-
-    ax.axhline(1.0, color='k', ls=':', alpha=0.4)
-    ax.set_xlabel('Years')
-    ax.set_ylabel('Equity (normalized)')
     ax.set_title(title or 'Equity fan chart (median, 25/75, 5/95)')
     if log_y:
         ax.set_yscale('log')
@@ -360,13 +345,8 @@ def plot_calmar_bar(
     # Build DataFrame of Calmar values.
     rows = []
     for r in results:
-        eq = r.equity_curves
-        years = (eq.shape[1] - 1) / 252
-        cagr = (eq[:, -1] / eq[:, 0]) ** (1 / years) - 1
-        dd_pct = r.max_drawdown_pct
-        calmar = np.where(dd_pct > 0, cagr / dd_pct, np.nan)
         rows.append({'strategy': r.strategy_name, 'rule': r.rule_name,
-                     'calmar': float(np.nanmean(calmar))})
+                     'calmar': float(np.nanmean(r.calmar))})
     df = pd.DataFrame(rows)
 
     strategies = df['strategy'].unique()
@@ -499,10 +479,10 @@ def plot_rolling_return_violin(
             if not match:
                 continue
             r = match[0]
-            eq = r.equity_curves
-            if eq.shape[1] <= window_days:
+            roll = r.rolling_returns(window_days, use_cumulative_wealth=True)
+            if roll.shape[1] == 0:
                 continue
-            roll = (eq[:, window_days:] / eq[:, :-window_days] - 1).ravel()
+            roll = roll.ravel()
             # Subsample if too large for violin.
             if len(roll) > max_sample:
                 rng = np.random.default_rng(0)
@@ -807,30 +787,23 @@ def institutional_summary(
     rows = []
     for r in results:
         tr     = r.total_returns       # (equity + cash) / initial - 1
-        tw     = r.terminal_wealth     # equity + cumulative cash (correct)
         dd_pct = r.max_drawdown_pct
-        n_days = r.equity_curves.shape[1] - 1
-        years  = n_days / 252
+        cagr  = r.cagr
 
-        # CAGR from corrected terminal_wealth.
-        cagr = (tw / r.initial_capital) ** (1 / years) - 1
-
-        # Rolling 1yr from equity_curves (within-quarter experience).
-        eq = r.equity_curves
-        if eq.shape[1] > 252:
-            roll_1y  = eq[:, 252:] / eq[:, :-252] - 1
+        # Rolling 1yr investor wealth, including extracted cash when
+        # quarterly reset is active.
+        roll_1y = r.rolling_returns(252, use_cumulative_wealth=True)
+        if roll_1y.shape[1] > 0:
             worst_1y = np.quantile(roll_1y.ravel(), 0.05)
         else:
             worst_1y = np.nan
-
-        calmar = np.where(dd_pct > 0, cagr / dd_pct, np.nan)
 
         row = {
             'strategy':          r.strategy_name,
             'rule':              r.rule_name,
             'mean_CAGR':         cagr.mean(),
             'median_CAGR':       np.median(cagr),
-            'mean_Calmar':       np.nanmean(calmar),
+            'mean_Calmar':       np.nanmean(r.calmar),
             'mean_maxDD_%':      dd_pct.mean(),
             'p95_maxDD_%':       np.quantile(dd_pct, 0.95),
             'rolling_1yr_p05':   worst_1y,

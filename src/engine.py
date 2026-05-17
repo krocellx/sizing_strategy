@@ -23,13 +23,19 @@ class BacktestResult:
     transaction_cost_bps: float = 0.0        # one-way cost applied, for reference
     cash_flows: np.ndarray | None = None     # (n_paths, n_quarters), NaN if no reset
     quarterly_reset: bool = False            # whether quarterly reset was applied
+    reset_every_days: int = 63
+
+    @property
+    def n_days(self) -> int:
+        return self.equity_curves.shape[1] - 1
+
+    @property
+    def years(self) -> float:
+        return self.n_days / 252
 
     @property
     def total_cash_flows(self) -> np.ndarray:
-        """
-        Sum of all cash flows per path (NaN-safe).
-        Zero for paths with no resets. Always zero when quarterly_reset=False.
-        """
+        """Sum all cash flows per path. Zero when no cash-flow reset is used."""
         if self.cash_flows is None:
             return np.zeros(len(self.equity_curves))
         return np.nansum(self.cash_flows, axis=1)
@@ -48,15 +54,13 @@ class BacktestResult:
         if self.cash_flows is None or not self.quarterly_reset:
             return self.equity_curves
 
-        n_paths, n_days_plus1 = self.equity_curves.shape
-        n_days = n_days_plus1 - 1
         n_quarters = self.cash_flows.shape[1]
-        reset_every = n_days // n_quarters  # approximate, same as used in reset
 
         # Build cumulative cash up to each day.
+        n_paths, n_days_plus1 = self.equity_curves.shape
         cumcash = np.zeros((n_paths, n_days_plus1))
         for q_idx in range(n_quarters):
-            t = (q_idx + 1) * reset_every     # day of reset
+            t = (q_idx + 1) * self.reset_every_days
             if t >= n_days_plus1:
                 break
             cf = np.where(np.isfinite(self.cash_flows[:, q_idx]),
@@ -84,6 +88,10 @@ class BacktestResult:
         return self.terminal_wealth / self.initial_capital - 1.0
 
     @property
+    def cagr(self) -> np.ndarray:
+        return (self.terminal_wealth / self.initial_capital) ** (1 / self.years) - 1
+
+    @property
     def max_drawdowns(self) -> np.ndarray:
         """
         Max drawdown per path in dollars, from running HWM.
@@ -103,17 +111,43 @@ class BacktestResult:
         dd_pct = (hwm - self.equity_curves) / hwm
         return dd_pct.max(axis=1)
 
+    @property
+    def calmar(self) -> np.ndarray:
+        dd_pct = self.max_drawdown_pct
+        return np.where(dd_pct > 0, self.cagr / dd_pct, np.nan)
+
+    @property
+    def daily_equity_returns(self) -> np.ndarray:
+        return np.diff(self.equity_curves, axis=1) / self.equity_curves[:, :-1]
+
+    @property
+    def sharpe(self) -> np.ndarray:
+        daily = self.daily_equity_returns
+        sd = daily.std(axis=1)
+        with np.errstate(invalid='ignore', divide='ignore'):
+            return np.where(sd > 0, daily.mean(axis=1) / sd * np.sqrt(252), np.nan)
+
+    def rolling_returns(
+        self,
+        window_days: int = 252,
+        use_cumulative_wealth: bool = True,
+    ) -> np.ndarray:
+        """
+        Rolling path returns across all start dates.
+
+        use_cumulative_wealth=True reports investor total wealth, including
+        extracted cash from quarterly resets. Set False for in-fund equity
+        experience.
+        """
+        curve = self.cumulative_wealth_curves if use_cumulative_wealth else self.equity_curves
+        if curve.shape[1] <= window_days:
+            return np.empty((curve.shape[0], 0))
+        return curve[:, window_days:] / curve[:, :-window_days] - 1.0
+
     def summary(self) -> pd.Series:
         tr = self.total_returns
         dd = self.max_drawdowns
         dd_pct = self.max_drawdown_pct
-        n_days = self.equity_curves.shape[1] - 1
-        years = n_days / 252
-        # CAGR uses total investor wealth (equity + cash).
-        cagr = (self.terminal_wealth / self.initial_capital) ** (1 / years) - 1
-        # Sharpe from daily equity-curve returns (captures within-quarter dynamics).
-        daily_eq_returns = np.diff(self.equity_curves, axis=1) / self.equity_curves[:, :-1]
-        sharpe = daily_eq_returns.mean(axis=1) / daily_eq_returns.std(axis=1) * np.sqrt(252)
         s = pd.Series({
             'strategy': self.strategy_name,
             'rule': self.rule_name,
@@ -121,13 +155,13 @@ class BacktestResult:
             'median_total_return': np.median(tr),
             'p05_total_return': np.percentile(tr, 5),
             'p95_total_return': np.percentile(tr, 95),
-            'mean_cagr': cagr.mean(),
+            'mean_cagr': self.cagr.mean(),
             'mean_max_dd_$': dd.mean(),
             'p95_max_dd_$': np.percentile(dd, 95),
             'p99_max_dd_$': np.percentile(dd, 99),
             'mean_max_dd_pct': dd_pct.mean(),
             'p95_max_dd_pct': np.percentile(dd_pct, 95),
-            'mean_sharpe': sharpe.mean(),
+            'mean_sharpe': np.nanmean(self.sharpe),
             'prob_loss': (tr < 0).mean(),
             'prob_50pct_dd': (dd_pct > 0.5).mean(),
         })
@@ -323,6 +357,7 @@ def run_backtest(
             transaction_cost_bps=transaction_cost_bps,
             cash_flows=cfs,
             quarterly_reset=quarterly_reset,
+            reset_every_days=reset_every_days,
         )
 
     # Fast path: NoStop is trivial.
