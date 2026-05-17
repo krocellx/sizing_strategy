@@ -1,189 +1,286 @@
-# Trailing Stop Evaluation via Stationary Bootstrap
+# Strategy Sizing and Stop-Rule Robustness
 
-## Objective
+This project evaluates whether path-dependent position-sizing rules improve
+the risk-return profile of a strategy or signal. The original use case is a
+tiered trailing stop, but the framework is now structured around reusable
+simulation, rule, backtest, metric, and reporting layers.
 
-Evaluate whether a tiered trailing-stop / position-sizing rule makes the
-risk-return trade-off better or worse across several stock-picking strategies,
-under realistic market dynamics. The testing rule in scope:
+The key idea is still the same: a stop rule depends on the sequence of returns,
+not just the final distribution. A single historical backtest is too thin, so
+the project bootstraps many realistic return paths and measures how the rule
+behaves across those paths.
 
-- Cut position to 70% when drawdown from HWM reaches **$400k**
-- Cut further to 40% at **$1.1m** drawdown
-- Fully exit at **$2m** drawdown
-- Step back up one level if the drawdown retreats **$300k** below the current trigger threshold
+## Current Rule Family
 
-This rule is path-dependent — its behavior depends on the *sequence* of returns,
-not just the distribution — so back-testing on a single historical series is
-too thin to draw conclusions. We use 10,000 simulated 5-year paths built from
-20 years of history to map the full distribution of outcomes.
+The baseline fixed trailing stop is:
 
-## Method
+- Cut position to 70% when drawdown from high-water mark reaches `$400k`
+- Cut further to 40% at `$1.1m`
+- Fully exit at `$2m`
+- Step back up when drawdown recovers by the configured re-entry amount
 
-### Stationary bootstrap for path simulation
+The code also supports volatility-scaled variants:
 
-We generate simulated paths by stitching together random-length blocks of
-consecutive historical days (Politis & Romano 1994). Block lengths are
-geometric random variables with mean `L`, so the process is stationary and
-preserves local dependence structure (autocorrelation, vol clustering) while
-still producing path diversity.
+- `VolScaledTrailingStop`: scales trigger levels by current realised vol versus
+  a fixed reference vol.
+- `RatioVolScaledTrailingStop`: scales trigger levels by a realised-vol ratio,
+  defaulting to long-window vol over short-window vol. This is conservative
+  when short-term volatility spikes because the multiplier falls and thresholds
+  tighten.
 
-The bootstrap is implemented as a functional pipeline: we generate one
-`(n_paths × path_length)` index matrix into history, then apply the same
-indices to every strategy's return series. This guarantees each strategy sees
-the same simulated "market history," so stop-vs-no-stop comparisons aren't
-contaminated by simulation noise.
+## Architecture
 
-`L` defaults to the Politis-White automatic estimate (typically 5–20 days on
-daily equity data) but can be overridden. Sensitivity sweeps across
-`L ∈ {10, 30, 60, 120, 250}` check whether conclusions are robust to this
-choice.
+The code is intentionally split into four layers:
 
-### Backtest engine and stop rule
+1. Scenario generation creates bootstrapped return paths.
+2. Stop rules own position-sizing state and any optimized fast path.
+3. The backtest engine applies a rule to paths and returns a result object.
+4. Analysis and plotting consume result metrics rather than recalculating them.
 
-Each stop rule is a `StopRule` subclass with a `reset(initial_capital)` and
-`update(equity)` interface. The engine drives the rule day-by-day, with a
-numba-jit fast path for `TrailingStopRule` (~50-100× faster than a pure
-Python loop). Each (strategy × rule) combination runs against the same
-scenario set and produces a `BacktestResult` with per-path equity curves,
-position sizes, and summary statistics.
+This keeps rule logic, metric logic, and presentation logic separate.
 
-## Project structure
+## Project Structure
 
-```
+```text
 src/
-  simulation.py    functional bootstrap: generate_scenarios, politis_white_L
-  stop_rules.py    StopRule ABC + NoStop + TrailingStopRule (OOP)
-  engine.py        BacktestResult + run_backtest (numba-jit fast path)
-  analysis.py      percentile tables, CVaR, drawdown dynamics,
-                   conditional analysis, paired / bootstrap significance
-  institutional.py allocator-facing metrics + four-panel visual one-pager
-  sensitivity.py   robustness sweeps over L, rule parameters, capital
-run.py             end-to-end runner: produces all tables and plots
-validate.py        single-path validation: proves calculations are correct
+  simulation.py       Stationary bootstrap and scenario generation.
+  stop_rules.py       StopRule interface, concrete rules, and numba fast paths.
+  engine.py           run_backtest, BacktestResult, transaction costs,
+                      quarterly reset cash flows, result-level metrics.
+  cache.py            Chunked disk-backed CachedResult for large runs.
+  analysis.py         Distribution tables, CVaR, drawdown analysis,
+                      paired comparisons, bootstrap confidence intervals.
+  institutional.py    Allocator-facing summaries and plots. Uses result metrics.
+  sensitivity.py      Robustness sweeps over block length, rule params, capital.
+  example_data.py     Synthetic strategy-return generator for demos.
+  validate.py         Independent path-level validation checks.
+  helpers.py          Notebook scratch/helper code, not a core API.
+  utility.py          Small experimental utilities.
+
+run.py                End-to-end runner.
+analysis.ipynb        Exploratory notebook.
+requirements.txt      Python dependencies.
 ```
 
-## How to evaluate the rule
+## Important Design Points
 
-The analysis is organized around a core question:
-**does the stop's insurance payoff (reduced left tail) justify its premium
-(lost right tail), across realistic market conditions?**
+### Stop Rules Own Their Fast Paths
 
-### 1. Start with the institutional one-pager
-
-`onepager_<strategy>.png` has four panels that together tell the story:
-
-- **Equity fan chart** — median + 25/75 + 5/95 percentile bands over time,
-  with and without the stop. Shows how the stop reshapes the distribution
-  of trajectories. Good stops narrow the fan asymmetrically — cutting more
-  downside than upside.
-- **Drawdown fan chart** — drawdown from HWM by percentile. A binding stop
-  produces flat percentile curves around the hard-stop level.
-- **Return vs max DD scatter** — one dot per path. With-stop cloud is capped
-  on the DD axis; the visual gap between the two clouds is exactly the
-  trade-off.
-- **"Did the stop help?" histogram** — per-path terminal-return delta.
-  Right-skewed distribution with a fat right tail = stop earns its keep
-  (saves bad paths). Symmetric or left-skewed = stop is just premium with
-  no payoff.
-
-### 2. The headline metrics an allocator asks about
-
-`institutional_summary.csv`:
-- **CAGR** — mean and median across paths
-- **Calmar (CAGR / max DD)** — the single most-cited risk-adjusted metric in
-  real allocator conversations. Good stops improve Calmar even when they
-  reduce CAGR.
-- **p95 max DD %** — "what does a bad drawdown look like?"
-- **Rolling 1yr p05** — the worst 1-year return an investor could have
-  experienced at the worst possible entry point.
-- **CVaR at 5%** — mean terminal return in the worst 5% of paths.
-- **P(max DD > {10, 15, 20, 30}%)** — mandate-trigger probabilities.
-
-`stop_activity.csv` answers "how often does this rule actually fire?" —
-cuts/raises/stopouts per year and days-at-reduced-size. A rule that triggers
-5×/year has real frictional cost that should be pricing in.
-
-### 3. Deeper diagnostics (in `run.py` stdout)
-
-- **Conditional comparison by worst_30d** — does the stop help most in the
-  bottom-quintile bucket (worst-stress paths)? If yes, it's a genuine tail
-  hedge. If it helps uniformly across buckets, it's just reducing risk
-  proportionally.
-- **Paired comparison + bootstrap CI** — percentage of paths where the stop
-  helped, and whether the mean-return difference is statistically
-  distinguishable from zero. If the CI crosses zero, you don't have a robust
-  edge.
-
-### 4. Robustness checks
-
-- **Sensitivity to L** — `sensitivity_L.csv`. If the stop's ranking vs no-stop
-  flips as L varies, the rule is exploiting simulation artifacts rather than
-  real dynamics.
-- **Sensitivity to rule parameters** — `sensitivity_params.csv`. Sweeps the
-  trigger levels ±25% and varies the re-entry recovery amount. Healthy rules
-  show smooth performance gradients; sharp differences = overfit to specific
-  thresholds.
-
-### Interpretation framework
-
-Put the facts together in this order:
-
-1. Does the stop meaningfully compress drawdowns? (institutional_summary DD
-   columns, drawdown fan chart)
-2. What's the cost? (mean CAGR comparison, equity fan right-tail band)
-3. Is the cost worth it for *this particular allocator's* risk tolerance?
-   (CVaR, P(max DD > mandate trigger), rolling 1yr p05)
-4. Is the conclusion robust? (sensitivity sweeps, bootstrap CI)
-5. Does it work uniformly across strategies, or only some? (per-strategy
-   "did it help" histograms)
-
-A robust answer needs all five to line up. If they don't, the inconsistencies
-themselves are the finding — usually they reveal that the rule works for one
-strategy character (e.g. trend-following) but not another (e.g. mean-reversion).
-
-## Usage
+Each rule implements the common interface:
 
 ```python
-from src import generate_scenarios, NoStop, TrailingStopRule, run_backtest
+rule.reset(initial_capital)
+rule.observe_return(daily_return)
+next_size = rule.update(equity)
+```
 
-# Provide daily returns for each strategy, aligned to the same dates.
+Rules that have a numba implementation expose `run_fast_path()`. The engine
+detects this method and uses it automatically. This keeps the optimized njit
+logic next to the Python state machine, reducing the chance that the two drift
+out of sync.
+
+### Result Objects Own Metrics
+
+`BacktestResult` is the single place for core calculations:
+
+- `terminal_wealth`
+- `total_returns`
+- `cagr`
+- `max_drawdowns`
+- `max_drawdown_pct`
+- `calmar`
+- `sharpe`
+- `rolling_returns()`
+- `cumulative_wealth_curves`
+
+This matters for quarterly reset mode. In that mode, profitable quarters can
+withdraw cash and reset in-fund equity to initial capital. Raw terminal equity
+can understate true investor wealth, so CAGR and total return must use:
+
+```text
+terminal wealth = terminal equity + cumulative cash flows
+```
+
+Plots and tables in `institutional.py` now consume these result-level metrics
+instead of duplicating CAGR or Calmar calculations.
+
+### Cached Results Match the Public Metric Surface
+
+`CachedResult` mirrors the main metric properties while loading full curves
+lazily from disk. Use `run_backtest_chunked()` when path counts are too large
+to keep every curve in memory.
+
+## Bootstrap Method
+
+Scenario generation uses stationary bootstrap over historical daily returns.
+It builds a single `(n_paths, path_length)` index matrix and applies that same
+matrix to every strategy. This ensures each strategy sees the same simulated
+market sequence, so paired comparisons are not polluted by different random
+paths.
+
+`L_mean=None` uses the automatic Politis-White estimate. You can also sweep
+manual block lengths with `sensitivity_to_L()` to test whether conclusions are
+stable across bootstrap assumptions.
+
+For true signal robustness, the strongest test is to bootstrap underlying
+market or feature data and rerun the signal on each simulated path. When that
+is too expensive, bootstrapping realised strategy returns is still useful for
+path-dependent stop-rule robustness, but it does not prove the signal itself is
+stable under perturbed feature histories.
+
+## Basic Usage
+
+```python
+from src import (
+    generate_scenarios,
+    NoStop,
+    TrailingStopRule,
+    RatioVolScaledTrailingStop,
+    run_backtest,
+    compare,
+)
+
+# Daily strategy returns as aligned pandas Series.
 historical_returns = {
-    'strategy_A': returns_A,  # pd.Series
-    'strategy_B': returns_B,
+    "strategy_A": returns_A,
+    "strategy_B": returns_B,
 }
 
-# Generate 10k simulated 5-year paths, reused across all strategies.
 scenarios = generate_scenarios(
     historical_returns=historical_returns,
-    n_paths=10_000, path_length=1260, L_mean=None, seed=42,
+    n_paths=10_000,
+    path_length=1260,
+    L_mean=None,
+    seed=42,
 )
 
-# Define a stop rule.
-rule = TrailingStopRule(
-    levels=[(400_000, 0.70), (1_100_000, 0.40), (2_000_000, 0.00)],
-    reentry_recovery=300_000,
-)
+levels = [
+    (400_000, 0.70),
+    (1_100_000, 0.40),
+    (2_000_000, 0.00),
+]
 
-# Backtest.
-result = run_backtest(
-    scenarios['paths']['strategy_A'], rule, 'strategy_A',
+baseline = run_backtest(
+    scenarios["paths"]["strategy_A"],
+    NoStop(),
+    "strategy_A",
     initial_capital=10_000_000,
+)
+
+fixed_stop = run_backtest(
+    scenarios["paths"]["strategy_A"],
+    TrailingStopRule(levels=levels, reentry_recovery=300_000),
+    "strategy_A",
+    initial_capital=10_000_000,
+)
+
+ratio_stop = run_backtest(
+    scenarios["paths"]["strategy_A"],
+    RatioVolScaledTrailingStop(
+        base_levels=levels,
+        base_reentry_recovery=300_000,
+        numerator_window=252,
+        denominator_window=63,
+    ),
+    "strategy_A",
+    initial_capital=10_000_000,
+)
+
+summary = compare([baseline, fixed_stop, ratio_stop])
+```
+
+## Quarterly Reset Mode
+
+Use quarterly reset mode when the mandate takes profits out at quarter-end
+while the strategy is fully invested:
+
+```python
+result = run_backtest(
+    scenarios["paths"]["strategy_A"],
+    rule,
+    "strategy_A",
+    initial_capital=10_000_000,
+    quarterly_reset=True,
+    reset_every_days=63,
 )
 ```
 
-See `run.py` for the full evaluation pipeline.
+When `quarterly_reset=True`, `result.terminal_wealth`, `result.total_returns`,
+`result.cagr`, `result.calmar`, and `institutional_summary()` include extracted
+cash flows.
+
+## Institutional Analysis
+
+`institutional_summary(results)` produces one row per result with:
+
+- Mean and median CAGR
+- Mean Calmar
+- Mean and p95 max drawdown
+- Rolling one-year p05 return
+- CVaR at 5%
+- Probability of negative terminal return
+- Probability of breaching drawdown thresholds
+- Cash-flow stats when quarterly reset is active
+
+Common plots:
+
+- `plot_equity_fan()`
+- `plot_drawdown_fan()`
+- `plot_return_vs_dd_scatter()`
+- `plot_did_stop_help()`
+- `plot_calmar_bar()`
+- `plot_dd_breach_heatmap()`
+- `plot_rolling_return_violin()`
+- `plot_stop_activity_bar()`
+- `plot_survival_curve()`
+- `plot_stopout_pct()`
+
+These functions should stay presentation-focused. If a new reusable metric is
+needed, add it to `BacktestResult` first, then have plots consume it.
+
+## Robustness Checks
+
+Use the sensitivity module to test whether conclusions survive reasonable
+changes in assumptions:
+
+- `sensitivity_to_L()`: rerun on different bootstrap block lengths.
+- `sensitivity_to_rule_params()`: sweep trigger levels and re-entry settings
+  on a fixed scenario set.
+- `sensitivity_to_capital()`: test absolute-dollar thresholds across different
+  account sizes or allocation mixes.
+
+Healthy rules usually show smooth gradients. Sharp cliffs around one parameter
+set are a warning sign for overfitting.
 
 ## Validation
 
-`validate.py` proves the path-level mechanics are correct by:
+Install dependencies:
 
-1. Verifying the bootstrap lookup is consistent
-   (`paths[i, t] == historical_returns[idx[i, t]]`)
-2. Replaying the trailing-stop rule for one path in pure Python, outside the
-   engine, and confirming every equity value and position size matches the
-   engine's output bit-for-bit
-3. Checking that terminal wealth, total return, max DD ($), and max DD (%)
-   derived from the equity curve match the engine's summary properties
-4. Cross-checking the NoStop case against `initial × cumprod(1 + r)`
+```bash
+python3 -m pip install -r requirements.txt
+```
 
-Run `python validate.py` — all checks should pass with zero floating-point
-error.
+Run the path-level validation:
+
+```bash
+python3 src/validate.py
+```
+
+The validation checks:
+
+1. Bootstrapped paths equal direct historical-return lookup by index.
+2. A single path replayed by hand matches engine equity and position sizes.
+3. Terminal wealth, total return, max drawdown dollars, and max drawdown
+   percent match `BacktestResult` properties.
+4. `NoStop` matches the independent `initial * cumprod(1 + returns)` formula.
+
+## Outputs
+
+The current runner/notebook workflow may produce files such as:
+
+- `backtest_results.csv`
+- `institutional_summary.csv`
+- `distribution_overlays.png`
+- `onepager_<strategy>.png`
+
+Generated outputs are analysis artifacts, not source files.
