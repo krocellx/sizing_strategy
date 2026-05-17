@@ -208,9 +208,14 @@ class VolScaledTrailingStop(StopRule):
     ---------
     At each refresh point, compute:
         vol_mult = current_realised_vol / reference_vol
-    Then the active trigger and reentry are:
+    Then the active reduction trigger and reentry are:
         active_trigger_i = base_trigger_i * vol_mult
         active_reentry   = base_reentry   * vol_mult
+
+    Full stop-out levels (size == 0.0) are hard-dollar stops and do not
+    scale with vol_mult. Once the first nonzero reduction is triggered, the
+    current vol_mult is locked until the rule returns to full size so stop
+    thresholds do not fluctuate while already reduced.
 
     Parameters
     ----------
@@ -257,6 +262,8 @@ class VolScaledTrailingStop(StopRule):
     _current_level_idx: int = field(default=-1, init=False)
     _sorted_base_levels: list = field(default_factory=list, init=False)
     _vol_mult: float = field(default=1.0, init=False)
+    _locked_vol_mult: float = field(default=1.0, init=False)
+    _vol_mult_locked: bool = field(default=False, init=False)
     _return_buffer: list = field(default_factory=list, init=False)
     _days_since_refresh: int = field(default=0, init=False)
 
@@ -276,6 +283,8 @@ class VolScaledTrailingStop(StopRule):
         self._hwm = initial_capital
         self._current_size = 1.0
         self._current_level_idx = -1
+        self._locked_vol_mult = 1.0
+        self._vol_mult_locked = False
 
         # Seed return buffer with historical returns if provided.
         if self.initial_daily_returns is not None:
@@ -291,6 +300,8 @@ class VolScaledTrailingStop(StopRule):
         self._hwm = initial_capital
         self._current_size = 1.0
         self._current_level_idx = -1
+        self._locked_vol_mult = 1.0
+        self._vol_mult_locked = False
 
     def _current_realised_vol(self) -> float:
         """Annualised realised vol from buffer, or reference_vol if too few obs."""
@@ -304,6 +315,12 @@ class VolScaledTrailingStop(StopRule):
         self._vol_mult = current_vol / self.reference_vol
         self._days_since_refresh = 0
 
+    def _effective_level_mult(self, level_idx: int) -> float:
+        """Full stop levels are hard-dollar; other levels use live/locked vol."""
+        if self._sorted_base_levels[level_idx][1] == 0.0:
+            return 1.0
+        return self._locked_vol_mult if self._vol_mult_locked else self._vol_mult
+
     def observe_return(self, daily_return: float) -> None:
         """Track raw strategy return for vol estimation."""
         self._return_buffer.append(daily_return)
@@ -315,14 +332,17 @@ class VolScaledTrailingStop(StopRule):
         # In monthly mode, refresh on cadence.
         if (self.refresh_mode == "monthly"
                 and self._days_since_refresh >= self.monthly_days):
-            self._refresh_vol_mult()
-
-        active_reentry = self.base_reentry_recovery * self._vol_mult
+            if self._vol_mult_locked:
+                self._days_since_refresh = 0
+            else:
+                self._refresh_vol_mult()
 
         if equity > self._hwm:
             self._hwm = equity
             self._current_size = 1.0
             self._current_level_idx = -1
+            self._locked_vol_mult = 1.0
+            self._vol_mult_locked = False
             if self.refresh_mode == "hwm":
                 self._refresh_vol_mult()
             return 1.0
@@ -332,21 +352,22 @@ class VolScaledTrailingStop(StopRule):
         # Single scan — result used for both ratchet-down and re-entry.
         warranted_idx = -1
         for i, (base_trigger, _) in enumerate(self._sorted_base_levels):
-            if drawdown >= base_trigger * self._vol_mult:
+            if drawdown >= base_trigger * self._effective_level_mult(i):
                 warranted_idx = i
-            else:
-                break
 
         if warranted_idx > self._current_level_idx:
+            if self._current_level_idx == -1:
+                self._locked_vol_mult = self._vol_mult
+                self._vol_mult_locked = True
             self._current_level_idx = warranted_idx
             self._current_size = self._sorted_base_levels[warranted_idx][1]
 
-        elif active_reentry > 0 and self._current_level_idx >= 0:
+        elif self.base_reentry_recovery > 0 and self._current_level_idx >= 0:
             # Threshold-based re-entry: DD has retreated active_reentry
             # below the current level's (vol-scaled) trigger.
-            current_trigger = (
-                self._sorted_base_levels[self._current_level_idx][0] * self._vol_mult
-            )
+            current_mult = self._effective_level_mult(self._current_level_idx)
+            active_reentry = self.base_reentry_recovery * current_mult
+            current_trigger = self._sorted_base_levels[self._current_level_idx][0] * current_mult
             recovery_from_trigger = current_trigger - drawdown
             if recovery_from_trigger >= active_reentry:
                 if warranted_idx < self._current_level_idx:
@@ -355,6 +376,10 @@ class VolScaledTrailingStop(StopRule):
                         1.0 if warranted_idx == -1
                         else self._sorted_base_levels[warranted_idx][1]
                     )
+                    if warranted_idx == -1:
+                        self._locked_vol_mult = 1.0
+                        self._vol_mult_locked = False
+                        self._refresh_vol_mult()
 
         return self._current_size
 
@@ -421,6 +446,10 @@ class RatioVolScaledTrailingStop(StopRule):
     Vol_mult is clamped to [vol_mult_floor, vol_mult_cap] to prevent
     degenerate threshold collapse or explosion in tail scenarios.
 
+    Full stop-out levels (size == 0.0) are hard-dollar stops and do not scale
+    with VR_t. The multiplier is locked at the first nonzero reduction and
+    unlocks only when the rule returns to full size.
+
     Parameters
     ----------
     base_levels : list of (base_trigger_dd, size)
@@ -476,6 +505,8 @@ class RatioVolScaledTrailingStop(StopRule):
     _current_level_idx: int = field(default=-1, init=False)
     _sorted_base_levels: list = field(default_factory=list, init=False)
     _vol_mult: float = field(default=1.0, init=False)
+    _locked_vol_mult: float = field(default=1.0, init=False)
+    _vol_mult_locked: bool = field(default=False, init=False)
     _numerator_buffer: list = field(default_factory=list, init=False)
     _denominator_buffer: list = field(default_factory=list, init=False)
     _days_since_refresh: int = field(default=0, init=False)
@@ -505,6 +536,8 @@ class RatioVolScaledTrailingStop(StopRule):
         self._current_size = 1.0
         self._current_level_idx = -1
         self._vol_mult = 1.0
+        self._locked_vol_mult = 1.0
+        self._vol_mult_locked = False
         self._numerator_buffer = []
         self._denominator_buffer = []
         self._days_since_refresh = 0
@@ -515,6 +548,8 @@ class RatioVolScaledTrailingStop(StopRule):
         self._hwm = initial_capital
         self._current_size = 1.0
         self._current_level_idx = -1
+        self._locked_vol_mult = 1.0
+        self._vol_mult_locked = False
 
     @staticmethod
     def _annualised_vol(buf: list) -> float:
@@ -541,6 +576,12 @@ class RatioVolScaledTrailingStop(StopRule):
             self._vol_mult = 1.0
         self._days_since_refresh = 0
 
+    def _effective_level_mult(self, level_idx: int) -> float:
+        """Full stop levels are hard-dollar; other levels use live/locked vol."""
+        if self._sorted_base_levels[level_idx][1] == 0.0:
+            return 1.0
+        return self._locked_vol_mult if self._vol_mult_locked else self._vol_mult
+
     def observe_return(self, daily_return: float) -> None:
         """Track raw strategy return (pre-stop) for vol estimation."""
         self._numerator_buffer.append(daily_return)
@@ -560,14 +601,17 @@ class RatioVolScaledTrailingStop(StopRule):
     def update(self, equity: float) -> float:
         if (self.refresh_mode == "monthly"
                 and self._days_since_refresh >= self.monthly_days):
-            self._refresh_vol_mult()
-
-        active_reentry = self.base_reentry_recovery * self._vol_mult
+            if self._vol_mult_locked:
+                self._days_since_refresh = 0
+            else:
+                self._refresh_vol_mult()
 
         if equity > self._hwm:
             self._hwm = equity
             self._current_size = 1.0
             self._current_level_idx = -1
+            self._locked_vol_mult = 1.0
+            self._vol_mult_locked = False
             if self.refresh_mode == "hwm":
                 self._refresh_vol_mult()
             return 1.0
@@ -577,21 +621,22 @@ class RatioVolScaledTrailingStop(StopRule):
         # Single scan — result used for both ratchet-down and re-entry.
         warranted_idx = -1
         for i, (base_trigger, _) in enumerate(self._sorted_base_levels):
-            if drawdown >= base_trigger * self._vol_mult:
+            if drawdown >= base_trigger * self._effective_level_mult(i):
                 warranted_idx = i
-            else:
-                break
 
         if warranted_idx > self._current_level_idx:
+            if self._current_level_idx == -1:
+                self._locked_vol_mult = self._vol_mult
+                self._vol_mult_locked = True
             self._current_level_idx = warranted_idx
             self._current_size = self._sorted_base_levels[warranted_idx][1]
 
-        elif active_reentry > 0 and self._current_level_idx >= 0:
+        elif self.base_reentry_recovery > 0 and self._current_level_idx >= 0:
             # Threshold-based re-entry: DD has retreated active_reentry
             # below the current level's (vol-scaled) trigger.
-            current_trigger = (
-                self._sorted_base_levels[self._current_level_idx][0] * self._vol_mult
-            )
+            current_mult = self._effective_level_mult(self._current_level_idx)
+            active_reentry = self.base_reentry_recovery * current_mult
+            current_trigger = self._sorted_base_levels[self._current_level_idx][0] * current_mult
             recovery_from_trigger = current_trigger - drawdown
             if recovery_from_trigger >= active_reentry:
                 if warranted_idx < self._current_level_idx:
@@ -600,6 +645,10 @@ class RatioVolScaledTrailingStop(StopRule):
                         1.0 if warranted_idx == -1
                         else self._sorted_base_levels[warranted_idx][1]
                     )
+                    if warranted_idx == -1:
+                        self._locked_vol_mult = 1.0
+                        self._vol_mult_locked = False
+                        self._refresh_vol_mult()
 
         return self._current_size
 
@@ -645,6 +694,61 @@ class RatioVolScaledTrailingStop(StopRule):
 # Numba fast paths live with their owning rules so the optimized path is
 # reviewed next to the Python state-machine implementation.
 if _HAS_NUMBA:
+    @njit(cache=True)
+    def _realised_vol_mult(buf, buf_filled, reference_vol):
+        if buf_filled < 2:
+            return 1.0
+        mean = 0.0
+        for i in range(buf_filled):
+            mean += buf[i]
+        mean /= buf_filled
+        var = 0.0
+        for i in range(buf_filled):
+            diff = buf[i] - mean
+            var += diff * diff
+        var /= (buf_filled - 1)
+        vol = np.sqrt(var) * np.sqrt(252.0)
+        return vol / reference_vol
+
+
+    @njit(cache=True)
+    def _ratio_vol_mult(num_buf, den_buf, num_filled, den_filled,
+                        vol_mult_floor, vol_mult_cap):
+        if num_filled < 2 or den_filled < 2:
+            return 1.0
+
+        mean_num = 0.0
+        for i in range(num_filled):
+            mean_num += num_buf[i]
+        mean_num /= num_filled
+        var_num = 0.0
+        for i in range(num_filled):
+            d = num_buf[i] - mean_num
+            var_num += d * d
+        var_num /= (num_filled - 1)
+        sig_num = np.sqrt(var_num) * np.sqrt(252.0)
+
+        mean_den = 0.0
+        for i in range(den_filled):
+            mean_den += den_buf[i]
+        mean_den /= den_filled
+        var_den = 0.0
+        for i in range(den_filled):
+            d = den_buf[i] - mean_den
+            var_den += d * d
+        var_den /= (den_filled - 1)
+        sig_den = np.sqrt(var_den) * np.sqrt(252.0)
+
+        if sig_den <= 0.0:
+            return 1.0
+        raw = sig_num / sig_den
+        if raw < vol_mult_floor:
+            raw = vol_mult_floor
+        if raw > vol_mult_cap:
+            raw = vol_mult_cap
+        return raw
+
+
     @njit(cache=True)
     def _trailing_stop_loop(returns, initial_capital,
                             level_dds, level_sizes, reentry_recovery):
@@ -716,20 +820,9 @@ if _HAS_NUMBA:
                 buf_filled = take
                 buf_head = take % vol_window_days
 
-            if buf_filled >= 2:
-                mean = 0.0
-                for i in range(buf_filled):
-                    mean += buf[i]
-                mean /= buf_filled
-                var = 0.0
-                for i in range(buf_filled):
-                    diff = buf[i] - mean
-                    var += diff * diff
-                var /= (buf_filled - 1)
-                vol = np.sqrt(var) * np.sqrt(252.0)
-                vol_mult = vol / reference_vol
-            else:
-                vol_mult = 1.0
+            vol_mult = _realised_vol_mult(buf, buf_filled, reference_vol)
+            locked_vol_mult = 1.0
+            vol_mult_locked = False
 
             eq = initial_capital
             equity[p, 0] = eq
@@ -747,18 +840,10 @@ if _HAS_NUMBA:
                 days_since_refresh += 1
 
                 if refresh_mode_code == 0 and days_since_refresh >= monthly_days:
-                    if buf_filled >= 2:
-                        mean = 0.0
-                        for i in range(buf_filled):
-                            mean += buf[i]
-                        mean /= buf_filled
-                        var = 0.0
-                        for i in range(buf_filled):
-                            diff = buf[i] - mean
-                            var += diff * diff
-                        var /= (buf_filled - 1)
-                        vol = np.sqrt(var) * np.sqrt(252.0)
-                        vol_mult = vol / reference_vol
+                    if not vol_mult_locked:
+                        vol_mult = _realised_vol_mult(
+                            buf, buf_filled, reference_vol
+                        )
                     days_since_refresh = 0
 
                 sizes[p, t] = cur_size
@@ -771,38 +856,54 @@ if _HAS_NUMBA:
                     hwm = eq
                     cur_size = 1.0
                     cur_level = -1
-                    if refresh_mode_code == 1 and buf_filled >= 2:
-                        mean = 0.0
-                        for i in range(buf_filled):
-                            mean += buf[i]
-                        mean /= buf_filled
-                        var = 0.0
-                        for i in range(buf_filled):
-                            diff = buf[i] - mean
-                            var += diff * diff
-                        var /= (buf_filled - 1)
-                        vol = np.sqrt(var) * np.sqrt(252.0)
-                        vol_mult = vol / reference_vol
+                    locked_vol_mult = 1.0
+                    vol_mult_locked = False
+                    if refresh_mode_code == 1:
+                        vol_mult = _realised_vol_mult(
+                            buf, buf_filled, reference_vol
+                        )
                         days_since_refresh = 0
                     continue
 
                 dd = hwm - eq
-                active_reentry = base_reentry_recovery * vol_mult
                 warranted = -1
                 for i in range(n_levels):
-                    if dd >= base_level_dds[i] * vol_mult:
+                    level_mult = 1.0
+                    if base_level_sizes[i] != 0.0:
+                        if vol_mult_locked:
+                            level_mult = locked_vol_mult
+                        else:
+                            level_mult = vol_mult
+                    if dd >= base_level_dds[i] * level_mult:
                         warranted = i
-                    else:
-                        break
 
                 if warranted > cur_level:
+                    if cur_level == -1:
+                        locked_vol_mult = vol_mult
+                        vol_mult_locked = True
                     cur_level = warranted
                     cur_size = base_level_sizes[warranted]
-                elif active_reentry > 0.0 and cur_level >= 0:
-                    recovery_from_trigger = base_level_dds[cur_level] * vol_mult - dd
+                elif base_reentry_recovery > 0.0 and cur_level >= 0:
+                    current_mult = 1.0
+                    if base_level_sizes[cur_level] != 0.0:
+                        if vol_mult_locked:
+                            current_mult = locked_vol_mult
+                        else:
+                            current_mult = vol_mult
+                    active_reentry = base_reentry_recovery * current_mult
+                    recovery_from_trigger = (
+                        base_level_dds[cur_level] * current_mult - dd
+                    )
                     if recovery_from_trigger >= active_reentry and warranted < cur_level:
                         cur_level = warranted
                         cur_size = 1.0 if warranted == -1 else base_level_sizes[warranted]
+                        if warranted == -1:
+                            locked_vol_mult = 1.0
+                            vol_mult_locked = False
+                            vol_mult = _realised_vol_mult(
+                                buf, buf_filled, reference_vol
+                            )
+                            days_since_refresh = 0
 
         return equity, sizes, vol_mult_log
 
@@ -830,6 +931,8 @@ if _HAS_NUMBA:
             den_head = 0
 
             vol_mult = 1.0
+            locked_vol_mult = 1.0
+            vol_mult_locked = False
             warmed_up = False
             days_since_refresh = 0
             in_path_days = 0
@@ -858,69 +961,21 @@ if _HAS_NUMBA:
 
                 if not warmed_up and in_path_days >= warmup_days:
                     warmed_up = True
-                    mean_num = 0.0
-                    for i in range(num_filled):
-                        mean_num += num_buf[i]
-                    mean_num /= num_filled
-                    var_num = 0.0
-                    for i in range(num_filled):
-                        d = num_buf[i] - mean_num
-                        var_num += d * d
-                    var_num /= (num_filled - 1)
-                    sig_num = np.sqrt(var_num) * np.sqrt(252.0)
-
-                    mean_den = 0.0
-                    for i in range(den_filled):
-                        mean_den += den_buf[i]
-                    mean_den /= den_filled
-                    var_den = 0.0
-                    for i in range(den_filled):
-                        d = den_buf[i] - mean_den
-                        var_den += d * d
-                    var_den /= (den_filled - 1)
-                    sig_den = np.sqrt(var_den) * np.sqrt(252.0)
-
-                    if sig_den > 0.0:
-                        raw = sig_num / sig_den
-                        if raw < vol_mult_floor:
-                            raw = vol_mult_floor
-                        if raw > vol_mult_cap:
-                            raw = vol_mult_cap
-                        vol_mult = raw
+                    if not vol_mult_locked:
+                        vol_mult = _ratio_vol_mult(
+                            num_buf, den_buf, num_filled, den_filled,
+                            vol_mult_floor, vol_mult_cap
+                        )
                     days_since_refresh = 0
 
                 if (refresh_mode_code == 0
                         and days_since_refresh >= monthly_days
                         and warmed_up):
-                    mean_num = 0.0
-                    for i in range(num_filled):
-                        mean_num += num_buf[i]
-                    mean_num /= num_filled
-                    var_num = 0.0
-                    for i in range(num_filled):
-                        d = num_buf[i] - mean_num
-                        var_num += d * d
-                    var_num /= (num_filled - 1)
-                    sig_num = np.sqrt(var_num) * np.sqrt(252.0)
-
-                    mean_den = 0.0
-                    for i in range(den_filled):
-                        mean_den += den_buf[i]
-                    mean_den /= den_filled
-                    var_den = 0.0
-                    for i in range(den_filled):
-                        d = den_buf[i] - mean_den
-                        var_den += d * d
-                    var_den /= (den_filled - 1)
-                    sig_den = np.sqrt(var_den) * np.sqrt(252.0)
-
-                    if sig_den > 0.0:
-                        raw = sig_num / sig_den
-                        if raw < vol_mult_floor:
-                            raw = vol_mult_floor
-                        if raw > vol_mult_cap:
-                            raw = vol_mult_cap
-                        vol_mult = raw
+                    if not vol_mult_locked:
+                        vol_mult = _ratio_vol_mult(
+                            num_buf, den_buf, num_filled, den_filled,
+                            vol_mult_floor, vol_mult_cap
+                        )
                     days_since_refresh = 0
 
                 sizes[p, t] = cur_size
@@ -933,55 +988,58 @@ if _HAS_NUMBA:
                     hwm = eq
                     cur_size = 1.0
                     cur_level = -1
+                    locked_vol_mult = 1.0
+                    vol_mult_locked = False
                     if refresh_mode_code == 1 and warmed_up:
-                        mean_num = 0.0
-                        for i in range(num_filled):
-                            mean_num += num_buf[i]
-                        mean_num /= num_filled
-                        var_num = 0.0
-                        for i in range(num_filled):
-                            d = num_buf[i] - mean_num
-                            var_num += d * d
-                        var_num /= (num_filled - 1)
-                        sig_num = np.sqrt(var_num) * np.sqrt(252.0)
-
-                        mean_den = 0.0
-                        for i in range(den_filled):
-                            mean_den += den_buf[i]
-                        mean_den /= den_filled
-                        var_den = 0.0
-                        for i in range(den_filled):
-                            d = den_buf[i] - mean_den
-                            var_den += d * d
-                        var_den /= (den_filled - 1)
-                        sig_den = np.sqrt(var_den) * np.sqrt(252.0)
-
-                        if sig_den > 0.0:
-                            raw = sig_num / sig_den
-                            if raw < vol_mult_floor:
-                                raw = vol_mult_floor
-                            if raw > vol_mult_cap:
-                                raw = vol_mult_cap
-                            vol_mult = raw
+                        vol_mult = _ratio_vol_mult(
+                            num_buf, den_buf, num_filled, den_filled,
+                            vol_mult_floor, vol_mult_cap
+                        )
                         days_since_refresh = 0
                     continue
 
                 dd = hwm - eq
-                active_reentry = base_reentry_recovery * vol_mult
                 warranted = -1
                 for i in range(n_levels):
-                    if dd >= base_level_dds[i] * vol_mult:
+                    level_mult = 1.0
+                    if base_level_sizes[i] != 0.0:
+                        if vol_mult_locked:
+                            level_mult = locked_vol_mult
+                        else:
+                            level_mult = vol_mult
+                    if dd >= base_level_dds[i] * level_mult:
                         warranted = i
-                    else:
-                        break
 
                 if warranted > cur_level:
+                    if cur_level == -1:
+                        locked_vol_mult = vol_mult
+                        vol_mult_locked = True
                     cur_level = warranted
                     cur_size = base_level_sizes[warranted]
-                elif active_reentry > 0.0 and cur_level >= 0:
-                    recovery_from_trigger = base_level_dds[cur_level] * vol_mult - dd
+                elif base_reentry_recovery > 0.0 and cur_level >= 0:
+                    current_mult = 1.0
+                    if base_level_sizes[cur_level] != 0.0:
+                        if vol_mult_locked:
+                            current_mult = locked_vol_mult
+                        else:
+                            current_mult = vol_mult
+                    active_reentry = base_reentry_recovery * current_mult
+                    recovery_from_trigger = (
+                        base_level_dds[cur_level] * current_mult - dd
+                    )
                     if recovery_from_trigger >= active_reentry and warranted < cur_level:
                         cur_level = warranted
                         cur_size = 1.0 if warranted == -1 else base_level_sizes[warranted]
+                        if warranted == -1:
+                            locked_vol_mult = 1.0
+                            vol_mult_locked = False
+                            if warmed_up:
+                                vol_mult = _ratio_vol_mult(
+                                    num_buf, den_buf, num_filled, den_filled,
+                                    vol_mult_floor, vol_mult_cap
+                                )
+                            else:
+                                vol_mult = 1.0
+                            days_since_refresh = 0
 
         return equity, sizes, vol_mult_log

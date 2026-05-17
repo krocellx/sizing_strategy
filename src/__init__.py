@@ -43,6 +43,7 @@ from .institutional import (
     plot_size_change_frequency,
     plot_historical_events,
     plot_survival_curve,
+    stopout_pct_table,
     plot_stopout_pct,
 )
 
@@ -72,4 +73,5 @@ __all__ = [
     "plot_calmar_bar", "plot_dd_breach_heatmap", "plot_rolling_return_violin",
     "plot_stop_activity_bar", "plot_conditional_diverging", "plot_size_change_frequency",
     "plot_historical_events", "plot_survival_curve", "plot_stopout_pct",
+    "stopout_pct_table",
 ]

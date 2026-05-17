@@ -902,40 +902,132 @@ def plot_survival_curve(results_dict, strategies, rules,
     return ax
 
 
-def plot_stopout_pct(results_dict, strategies, rules, ax=None):
+def stopout_pct_table(
+    results_dict,
+    strategies,
+    rules,
+    component_strategies=None,
+    capitals=None,
+    combined_name: str = "combined",
+    combined_mode: str = "portfolio",
+) -> pd.DataFrame:
+    """
+    Stop-out percentages used by plot_stopout_pct().
+
+    combined_mode controls how the combined row is interpreted:
+      - 'portfolio': combined position size hit zero. This means all sleeves
+        were flat at the same time, so it is usually very low.
+      - 'any_sleeve': at least one component sleeve hit zero on the path.
+      - 'all_sleeves': every component sleeve hit zero at some point.
+      - 'capital_weighted': average stopped capital share across paths.
+    """
+    valid_modes = {"portfolio", "any_sleeve", "all_sleeves", "capital_weighted"}
+    if combined_mode not in valid_modes:
+        raise ValueError(f"combined_mode must be one of {sorted(valid_modes)}")
+
+    component_strategies = list(
+        component_strategies or [s for s in strategies if s != combined_name]
+    )
+    rows = []
+    for strat in strategies:
+        for rule_key in rules:
+            key = (strat, rule_key)
+            if key not in results_dict:
+                rows.append({
+                    "strategy": strat,
+                    "rule_key": rule_key,
+                    "rule": np.nan,
+                    "stopout_pct": np.nan,
+                    "mode": combined_mode if strat == combined_name else "sleeve",
+                })
+                continue
+
+            rule_name = results_dict[key].rule_name
+            mode = "sleeve"
+            if strat == combined_name and combined_mode != "portfolio":
+                masks = []
+                weights = []
+                for comp in component_strategies:
+                    comp_key = (comp, rule_key)
+                    if comp_key not in results_dict:
+                        continue
+                    comp_sizes = results_dict[comp_key].position_sizes
+                    masks.append((comp_sizes == 0.0).any(axis=1))
+                    weights.append(float(capitals[comp]) if capitals else 1.0)
+                if not masks:
+                    pct = np.nan
+                elif combined_mode == "any_sleeve":
+                    pct = np.logical_or.reduce(masks).mean() * 100
+                elif combined_mode == "all_sleeves":
+                    pct = np.logical_and.reduce(masks).mean() * 100
+                else:
+                    mask_arr = np.vstack(masks)
+                    weight_arr = np.asarray(weights)[:, np.newaxis]
+                    stopped_share = (mask_arr * weight_arr).sum(axis=0) / weight_arr.sum()
+                    pct = stopped_share.mean() * 100
+                mode = combined_mode
+            else:
+                sizes = results_dict[key].position_sizes
+                pct = (sizes == 0.0).any(axis=1).mean() * 100
+                mode = "portfolio" if strat == combined_name else "sleeve"
+
+            rows.append({
+                "strategy": strat,
+                "rule_key": rule_key,
+                "rule": rule_name,
+                "stopout_pct": pct,
+                "mode": mode,
+            })
+    return pd.DataFrame(rows)
+
+
+def plot_stopout_pct(
+    results_dict,
+    strategies,
+    rules,
+    ax=None,
+    component_strategies=None,
+    capitals=None,
+    combined_name: str = "combined",
+    combined_mode: str = "portfolio",
+):
     """
     Bar chart: % of paths that hit full stop-out (size=0 at any point),
     grouped by strategy, bars per rule.
+
+    For the combined row, combined_mode='portfolio' preserves the old behavior:
+    it counts paths where the whole combined portfolio hit zero exposure.
+    Use combined_mode='any_sleeve' or 'capital_weighted' to answer sleeve-level
+    stop-out questions for the combined portfolio.
     
     results_dict: {(strat, rule_key): BacktestResult}
     """
     if ax is None:
         _, ax = plt.subplots(figsize=(12, 5))
     
+    df = stopout_pct_table(
+        results_dict,
+        strategies,
+        rules,
+        component_strategies=component_strategies,
+        capitals=capitals,
+        combined_name=combined_name,
+        combined_mode=combined_mode,
+    )
+
     colors = plt.cm.tab10.colors
-    rule_labels = list(dict.fromkeys(
-        results_dict[(s, r)].rule_name 
-        for s in strategies for r in rules 
-        if (s, r) in results_dict
-    ))
-    
     x = np.arange(len(strategies))
     width = 0.8 / len(rules)
     
     for i, rule_key in enumerate(rules):
-        pcts = []
-        for strat in strategies:
-            key = (strat, rule_key)
-            if key in results_dict:
-                sizes = results_dict[key].position_sizes
-                pct = (sizes == 0.0).any(axis=1).mean() * 100
-            else:
-                pct = np.nan
-            pcts.append(pct)
-        
+        sub = df[df["rule_key"] == rule_key].set_index("strategy")
+        pcts = [sub.loc[s, "stopout_pct"] if s in sub.index else np.nan
+                for s in strategies]
+        labels = sub["rule"].dropna()
+        label = labels.iloc[0] if len(labels) else rule_key
         offset = (i - len(rules) / 2 + 0.5) * width
         bars = ax.bar(x + offset, pcts, width * 0.9,
-                      label=results_dict[(strategies[0], rule_key)].rule_name,
+                      label=label,
                       color=colors[i % len(colors)], alpha=0.85)
         for bar, val in zip(bars, pcts):
             if not np.isnan(val):
@@ -945,10 +1037,15 @@ def plot_stopout_pct(results_dict, strategies, rules, ax=None):
     
     ax.set_xticks(x)
     ax.set_xticklabels(strategies, rotation=15, ha='right')
-    ax.set_ylabel('% of paths with full stop-out')
+    if combined_mode == "portfolio":
+        ax.set_ylabel('% of paths with full stop-out')
+        title_suffix = ''
+    else:
+        ax.set_ylabel(f'% stop-out ({combined_mode.replace("_", " ")})')
+        title_suffix = f' ({combined_mode.replace("_", " ")} for combined)'
     ax.set_ylim(0, 110)
     ax.axhline(100, color='k', ls=':', alpha=0.3)
-    ax.set_title('Full Stop-Out Rate by Strategy and Rule')
+    ax.set_title('Full Stop-Out Rate by Strategy and Rule' + title_suffix)
     ax.legend(fontsize=9)
     ax.grid(axis='y', alpha=0.3)
     return ax

@@ -28,6 +28,12 @@ The code also supports volatility-scaled variants:
   when short-term volatility spikes because the multiplier falls and thresholds
   tighten.
 
+For both vol-scaled rules, full stop-out levels (`size == 0`) remain hard
+dollar stops. Nonzero reduction levels use the current volatility multiplier
+until the first reduction, then lock that multiplier until the rule returns to
+full size. This keeps the `$2m` full stop stable instead of letting it fluctuate
+with the vol estimate.
+
 ## Architecture
 
 The code is intentionally split into four layers:
