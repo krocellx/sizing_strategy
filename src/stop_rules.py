@@ -383,17 +383,18 @@ class RatioVolScaledTrailingStop(StopRule):
 
     Vol multiplier is self-normalising — no reference vol parameter:
 
-        VR_t = σ̂_63,t / σ̂_252,t
+        VR_t = σ̂_numerator,t / σ̂_denominator,t
 
     where both are annualised trailing realised vols of the raw strategy
-    daily returns (pre-stop). A ratio > 1 means the recent 3-month vol is
-    elevated relative to the trailing year (stress regime) → thresholds widen.
-    A ratio < 1 means unusually calm → thresholds tighten.
+    daily returns (pre-stop). By default this is long-window vol over
+    short-window vol, which is conservative in short-term stress: if recent
+    vol spikes above long-run vol, the multiplier falls below 1 and tightens
+    the thresholds.
 
-    Warmup: during the first 252 in-path days, insufficient history exists
-    to compute σ̂_252 reliably. The rule uses fixed-dollar thresholds
-    (vol_mult = 1.0) during this period. On day 252, the ratio activates
-    immediately (snap, not blend).
+    Warmup: until both windows have enough observations, the rule uses
+    fixed-dollar thresholds (vol_mult = 1.0). The first ratio update happens
+    at max(numerator_window, denominator_window), then activates immediately
+    (snap, not blend).
 
     Vol_mult is clamped to [vol_mult_floor, vol_mult_cap] to prevent
     degenerate threshold collapse or explosion in tail scenarios.
@@ -404,10 +405,13 @@ class RatioVolScaledTrailingStop(StopRule):
         Trigger thresholds when VR_t = 1 (short-term vol = annual vol).
     base_reentry_recovery : float
         Recovery threshold when VR_t = 1. Scales same as triggers.
-    short_window : int
-        Short vol window in days. Default 63 (≈ 3 months).
-    long_window : int
-        Long vol window in days. Default 252 (≈ 1 year). Also sets warmup.
+    numerator_window : int, optional
+        Vol window used in the numerator. Defaults to long_window.
+    denominator_window : int, optional
+        Vol window used in the denominator. Defaults to short_window.
+    short_window, long_window : int
+        Backward-compatible aliases. The default ratio is long_window /
+        short_window.
     refresh_mode : {'monthly', 'hwm'}
         When to recompute VR_t.
         - 'monthly': every `monthly_days` trading days.
@@ -426,14 +430,16 @@ class RatioVolScaledTrailingStop(StopRule):
     -----
     - Both windows use raw strategy daily returns via observe_return(), so vol
       estimates remain valid even after full stop-out (flat equity ≠ zero vol).
-    - During warmup (days 0-251), vol_mult = 1.0 and the rule behaves exactly
-      like TrailingStopRule with the same base_levels.
+    - During warmup, vol_mult = 1.0 and the rule behaves exactly like
+      TrailingStopRule with the same base_levels.
     - VR_t uses lag-1 estimates (yesterday's rolling vol computed after
       observe_return() updates the buffer). This ensures no look-ahead.
     """
 
     base_levels: list[tuple[float, float]]
     base_reentry_recovery: float = 0.0
+    numerator_window: int | None = None
+    denominator_window: int | None = None
     short_window: int = 63
     long_window: int = 252
     refresh_mode: str = "monthly"
@@ -448,8 +454,8 @@ class RatioVolScaledTrailingStop(StopRule):
     _current_level_idx: int = field(default=-1, init=False)
     _sorted_base_levels: list = field(default_factory=list, init=False)
     _vol_mult: float = field(default=1.0, init=False)
-    _short_buffer: list = field(default_factory=list, init=False)
-    _long_buffer: list = field(default_factory=list, init=False)
+    _numerator_buffer: list = field(default_factory=list, init=False)
+    _denominator_buffer: list = field(default_factory=list, init=False)
     _days_since_refresh: int = field(default=0, init=False)
     _in_path_days: int = field(default=0, init=False)
     _warmed_up: bool = field(default=False, init=False)
@@ -465,16 +471,20 @@ class RatioVolScaledTrailingStop(StopRule):
             raise ValueError(
                 f"refresh_mode must be 'monthly' or 'hwm', got {self.refresh_mode!r}"
             )
-        if self.short_window >= self.long_window:
-            raise ValueError("short_window must be < long_window")
+        if self.numerator_window is None:
+            self.numerator_window = self.long_window
+        if self.denominator_window is None:
+            self.denominator_window = self.short_window
+        if self.numerator_window < 2 or self.denominator_window < 2:
+            raise ValueError("vol windows must be >= 2 days")
 
     def reset(self, initial_capital: float) -> None:
         self._hwm = initial_capital
         self._current_size = 1.0
         self._current_level_idx = -1
         self._vol_mult = 1.0
-        self._short_buffer = []
-        self._long_buffer = []
+        self._numerator_buffer = []
+        self._denominator_buffer = []
         self._days_since_refresh = 0
         self._in_path_days = 0
         self._warmed_up = False
@@ -487,14 +497,14 @@ class RatioVolScaledTrailingStop(StopRule):
 
     def _compute_vol_mult(self) -> float:
         """
-        Compute VR_t = σ_63 / σ_252.
+        Compute VR_t = σ_numerator / σ_denominator.
         Returns 1.0 if either estimate is unreliable (nan or zero).
         """
-        sig_short = self._annualised_vol(self._short_buffer)
-        sig_long = self._annualised_vol(self._long_buffer)
-        if np.isnan(sig_short) or np.isnan(sig_long) or sig_long == 0:
+        sig_num = self._annualised_vol(self._numerator_buffer)
+        sig_den = self._annualised_vol(self._denominator_buffer)
+        if np.isnan(sig_num) or np.isnan(sig_den) or sig_den == 0:
             return 1.0
-        raw = sig_short / sig_long
+        raw = sig_num / sig_den
         return float(np.clip(raw, self.vol_mult_floor, self.vol_mult_cap))
 
     def _refresh_vol_mult(self) -> None:
@@ -506,16 +516,16 @@ class RatioVolScaledTrailingStop(StopRule):
 
     def observe_return(self, daily_return: float) -> None:
         """Track raw strategy return (pre-stop) for vol estimation."""
-        self._short_buffer.append(daily_return)
-        if len(self._short_buffer) > self.short_window:
-            self._short_buffer.pop(0)
-        self._long_buffer.append(daily_return)
-        if len(self._long_buffer) > self.long_window:
-            self._long_buffer.pop(0)
+        self._numerator_buffer.append(daily_return)
+        if len(self._numerator_buffer) > self.numerator_window:
+            self._numerator_buffer.pop(0)
+        self._denominator_buffer.append(daily_return)
+        if len(self._denominator_buffer) > self.denominator_window:
+            self._denominator_buffer.pop(0)
         self._in_path_days += 1
         self._days_since_refresh += 1
-        # Snap warmup to active on day long_window.
-        if not self._warmed_up and self._in_path_days >= self.long_window:
+        warmup_days = max(self.numerator_window, self.denominator_window)
+        if not self._warmed_up and self._in_path_days >= warmup_days:
             self._warmed_up = True
             # Immediately refresh so next update uses the ratio.
             self._refresh_vol_mult()
@@ -596,8 +606,8 @@ class RatioVolScaledTrailingStop(StopRule):
             base_level_dds,
             base_level_sizes,
             float(self.base_reentry_recovery),
-            int(self.short_window),
-            int(self.long_window),
+            int(self.numerator_window),
+            int(self.denominator_window),
             refresh_mode_code,
             int(self.monthly_days),
             float(self.vol_mult_floor),
@@ -774,7 +784,7 @@ if _HAS_NUMBA:
     def _ratio_vol_scaled_loop(returns, initial_capital,
                                base_level_dds, base_level_sizes,
                                base_reentry_recovery,
-                               short_window, long_window,
+                               numerator_window, denominator_window,
                                refresh_mode_code, monthly_days,
                                vol_mult_floor, vol_mult_cap):
         n_paths, n_days = returns.shape
@@ -782,14 +792,15 @@ if _HAS_NUMBA:
         equity = np.empty((n_paths, n_days + 1))
         sizes = np.empty((n_paths, n_days))
         vol_mult_log = np.empty((n_paths, n_days))
+        warmup_days = max(numerator_window, denominator_window)
 
         for p in range(n_paths):
-            short_buf = np.zeros(short_window)
-            long_buf = np.zeros(long_window)
-            short_filled = 0
-            long_filled = 0
-            short_head = 0
-            long_head = 0
+            num_buf = np.zeros(numerator_window)
+            den_buf = np.zeros(denominator_window)
+            num_filled = 0
+            den_filled = 0
+            num_head = 0
+            den_head = 0
 
             vol_mult = 1.0
             warmed_up = False
@@ -805,45 +816,45 @@ if _HAS_NUMBA:
             for t in range(n_days):
                 r = returns[p, t]
 
-                short_buf[short_head] = r
-                short_head = (short_head + 1) % short_window
-                if short_filled < short_window:
-                    short_filled += 1
+                num_buf[num_head] = r
+                num_head = (num_head + 1) % numerator_window
+                if num_filled < numerator_window:
+                    num_filled += 1
 
-                long_buf[long_head] = r
-                long_head = (long_head + 1) % long_window
-                if long_filled < long_window:
-                    long_filled += 1
+                den_buf[den_head] = r
+                den_head = (den_head + 1) % denominator_window
+                if den_filled < denominator_window:
+                    den_filled += 1
 
                 in_path_days += 1
                 days_since_refresh += 1
 
-                if not warmed_up and in_path_days >= long_window:
+                if not warmed_up and in_path_days >= warmup_days:
                     warmed_up = True
-                    mean_s = 0.0
-                    for i in range(short_filled):
-                        mean_s += short_buf[i]
-                    mean_s /= short_filled
-                    var_s = 0.0
-                    for i in range(short_filled):
-                        d = short_buf[i] - mean_s
-                        var_s += d * d
-                    var_s /= (short_filled - 1)
-                    sig_short = np.sqrt(var_s) * np.sqrt(252.0)
+                    mean_num = 0.0
+                    for i in range(num_filled):
+                        mean_num += num_buf[i]
+                    mean_num /= num_filled
+                    var_num = 0.0
+                    for i in range(num_filled):
+                        d = num_buf[i] - mean_num
+                        var_num += d * d
+                    var_num /= (num_filled - 1)
+                    sig_num = np.sqrt(var_num) * np.sqrt(252.0)
 
-                    mean_l = 0.0
-                    for i in range(long_filled):
-                        mean_l += long_buf[i]
-                    mean_l /= long_filled
-                    var_l = 0.0
-                    for i in range(long_filled):
-                        d = long_buf[i] - mean_l
-                        var_l += d * d
-                    var_l /= (long_filled - 1)
-                    sig_long = np.sqrt(var_l) * np.sqrt(252.0)
+                    mean_den = 0.0
+                    for i in range(den_filled):
+                        mean_den += den_buf[i]
+                    mean_den /= den_filled
+                    var_den = 0.0
+                    for i in range(den_filled):
+                        d = den_buf[i] - mean_den
+                        var_den += d * d
+                    var_den /= (den_filled - 1)
+                    sig_den = np.sqrt(var_den) * np.sqrt(252.0)
 
-                    if sig_long > 0.0:
-                        raw = sig_short / sig_long
+                    if sig_den > 0.0:
+                        raw = sig_num / sig_den
                         if raw < vol_mult_floor:
                             raw = vol_mult_floor
                         if raw > vol_mult_cap:
@@ -854,30 +865,30 @@ if _HAS_NUMBA:
                 if (refresh_mode_code == 0
                         and days_since_refresh >= monthly_days
                         and warmed_up):
-                    mean_s = 0.0
-                    for i in range(short_filled):
-                        mean_s += short_buf[i]
-                    mean_s /= short_filled
-                    var_s = 0.0
-                    for i in range(short_filled):
-                        d = short_buf[i] - mean_s
-                        var_s += d * d
-                    var_s /= (short_filled - 1)
-                    sig_short = np.sqrt(var_s) * np.sqrt(252.0)
+                    mean_num = 0.0
+                    for i in range(num_filled):
+                        mean_num += num_buf[i]
+                    mean_num /= num_filled
+                    var_num = 0.0
+                    for i in range(num_filled):
+                        d = num_buf[i] - mean_num
+                        var_num += d * d
+                    var_num /= (num_filled - 1)
+                    sig_num = np.sqrt(var_num) * np.sqrt(252.0)
 
-                    mean_l = 0.0
-                    for i in range(long_filled):
-                        mean_l += long_buf[i]
-                    mean_l /= long_filled
-                    var_l = 0.0
-                    for i in range(long_filled):
-                        d = long_buf[i] - mean_l
-                        var_l += d * d
-                    var_l /= (long_filled - 1)
-                    sig_long = np.sqrt(var_l) * np.sqrt(252.0)
+                    mean_den = 0.0
+                    for i in range(den_filled):
+                        mean_den += den_buf[i]
+                    mean_den /= den_filled
+                    var_den = 0.0
+                    for i in range(den_filled):
+                        d = den_buf[i] - mean_den
+                        var_den += d * d
+                    var_den /= (den_filled - 1)
+                    sig_den = np.sqrt(var_den) * np.sqrt(252.0)
 
-                    if sig_long > 0.0:
-                        raw = sig_short / sig_long
+                    if sig_den > 0.0:
+                        raw = sig_num / sig_den
                         if raw < vol_mult_floor:
                             raw = vol_mult_floor
                         if raw > vol_mult_cap:
@@ -895,31 +906,31 @@ if _HAS_NUMBA:
                     hwm = eq
                     cur_size = 1.0
                     cur_level = -1
-                    if refresh_mode_code == 1 and warmed_up and short_filled >= 2:
-                        mean_s = 0.0
-                        for i in range(short_filled):
-                            mean_s += short_buf[i]
-                        mean_s /= short_filled
-                        var_s = 0.0
-                        for i in range(short_filled):
-                            d = short_buf[i] - mean_s
-                            var_s += d * d
-                        var_s /= (short_filled - 1)
-                        sig_short = np.sqrt(var_s) * np.sqrt(252.0)
+                    if refresh_mode_code == 1 and warmed_up:
+                        mean_num = 0.0
+                        for i in range(num_filled):
+                            mean_num += num_buf[i]
+                        mean_num /= num_filled
+                        var_num = 0.0
+                        for i in range(num_filled):
+                            d = num_buf[i] - mean_num
+                            var_num += d * d
+                        var_num /= (num_filled - 1)
+                        sig_num = np.sqrt(var_num) * np.sqrt(252.0)
 
-                        mean_l = 0.0
-                        for i in range(long_filled):
-                            mean_l += long_buf[i]
-                        mean_l /= long_filled
-                        var_l = 0.0
-                        for i in range(long_filled):
-                            d = long_buf[i] - mean_l
-                            var_l += d * d
-                        var_l /= (long_filled - 1)
-                        sig_long = np.sqrt(var_l) * np.sqrt(252.0)
+                        mean_den = 0.0
+                        for i in range(den_filled):
+                            mean_den += den_buf[i]
+                        mean_den /= den_filled
+                        var_den = 0.0
+                        for i in range(den_filled):
+                            d = den_buf[i] - mean_den
+                            var_den += d * d
+                        var_den /= (den_filled - 1)
+                        sig_den = np.sqrt(var_den) * np.sqrt(252.0)
 
-                        if sig_long > 0.0:
-                            raw = sig_short / sig_long
+                        if sig_den > 0.0:
+                            raw = sig_num / sig_den
                             if raw < vol_mult_floor:
                                 raw = vol_mult_floor
                             if raw > vol_mult_cap:
